@@ -13,25 +13,17 @@
 // binary's link step and R's final package .so link step.
 //
 // R headers come from `R CMD config --cppflags`, which emits the
-// canonical -I and -D flags for the active R installation.
+// canonical -I and -D flags for the active R installation. See
+// `r_cppflags` for how R is located and invoked robustly, including
+// under `R CMD check --as-cran`.
 
+use std::env;
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    let output = Command::new("R")
-        .args(["CMD", "config", "--cppflags"])
-        .output()
-        .expect("failed to invoke `R CMD config --cppflags`; is R on PATH?");
-
-    if !output.status.success() {
-        panic!(
-            "`R CMD config --cppflags` exited non-zero:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    let cppflags = String::from_utf8(output.stdout)
-        .expect("`R CMD config --cppflags` returned non-UTF-8 output");
+    let cppflags = r_cppflags();
 
     let mut builder = cc::Build::new();
     builder.file("src/rustgd_device.c");
@@ -56,4 +48,59 @@ fn main() {
 
     println!("cargo:rerun-if-changed=src/rustgd_device.c");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=R_HOME");
+}
+
+// Return R's C preprocessor flags via `R CMD config --cppflags`.
+//
+// Locating R: prefer the `R_HOME` environment variable, which R sets for
+// every package build (R CMD INSTALL, and the build nested inside R CMD
+// check), and fall back to `R` on PATH for a plain `cargo build` run outside
+// an R build. This avoids depending on PATH, which is not guaranteed inside
+// `R CMD check`.
+//
+// Environment: `R CMD check` exports `R_TESTS` pointing at a relative startup
+// file. The nested R that `R CMD config` starts then tries to load that file
+// from the wrong working directory and aborts, which is why the bare call
+// failed only under `R CMD check --as-cran`. Removing `R_TESTS` for this one
+// command sidesteps it without affecting the rest of the build.
+fn r_cppflags() -> String {
+    let r_bin = locate_r();
+
+    let output = Command::new(&r_bin)
+        .args(["CMD", "config", "--cppflags"])
+        .env_remove("R_TESTS")
+        .output()
+        .unwrap_or_else(|e| {
+            panic!(
+                "failed to invoke `{} CMD config --cppflags`: {e}; is R installed?",
+                r_bin.to_string_lossy()
+            )
+        });
+
+    if !output.status.success() {
+        panic!(
+            "`{} CMD config --cppflags` exited non-zero:\n{}",
+            r_bin.to_string_lossy(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    String::from_utf8(output.stdout)
+        .expect("`R CMD config --cppflags` returned non-UTF-8 output")
+}
+
+// Resolve the R executable: `$R_HOME/bin/R` (or R.exe on Windows) when R_HOME
+// is set and that file exists, otherwise the bare `R`/`R.exe` looked up on PATH.
+fn locate_r() -> OsString {
+    let exe = if cfg!(windows) { "R.exe" } else { "R" };
+    if let Some(home) = env::var_os("R_HOME") {
+        let mut p = PathBuf::from(home);
+        p.push("bin");
+        p.push(exe);
+        if p.is_file() {
+            return p.into_os_string();
+        }
+    }
+    OsString::from(exe)
 }

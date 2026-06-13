@@ -75,6 +75,7 @@ view <- function(df, title = NULL) {
 
 #' Internal: next descriptor number, one past the highest existing
 #' `frame-NNNN.txt`.
+#' @noRd
 .rustgd_frames_next_index <- function(frames) {
   existing <- list.files(frames, pattern = "^frame-[0-9]+\\.txt$")
   nums <- suppressWarnings(
@@ -89,6 +90,7 @@ view <- function(df, title = NULL) {
 #' [.rustgd_frames_alive()], which clears `.rustgd_state$frames_dir` when the
 #' window is gone, so here we simply launch whenever it is not our active
 #' directory.
+#' @noRd
 .rustgd_frames_ensure <- function(frames) {
   if (isTRUE(.rustgd_state$frames_dir == frames)) {
     return(invisible(NULL))
@@ -107,6 +109,7 @@ view <- function(df, title = NULL) {
 #' only if we launched for it, no close marker is present, and the pid the
 #' viewer recorded is still running. A force-killed viewer leaves no marker, so
 #' a pid that no longer exists is how we detect it and relaunch.
+#' @noRd
 .rustgd_frames_alive <- function(frames) {
   if (!isTRUE(.rustgd_state$frames_dir == frames)) {
     return(FALSE)
@@ -129,6 +132,7 @@ view <- function(df, title = NULL) {
 #' Internal: TRUE if a process with this pid is currently running. Uses
 #' `kill -0` on Unix and `tasklist` on Windows, so the frames liveness check
 #' works on every platform. The Windows branch is best-effort.
+#' @noRd
 .rustgd_pid_alive <- function(pid) {
   if (.Platform$OS.type == "windows") {
     out <- tryCatch(
@@ -155,6 +159,7 @@ view <- function(df, title = NULL) {
 
 #' Internal: remove this directory's frame files, close marker, and pid file so
 #' the next view() reopens the window fresh.
+#' @noRd
 .rustgd_frames_reset <- function(frames) {
   old <- list.files(
     frames,

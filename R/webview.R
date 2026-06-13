@@ -97,6 +97,7 @@ rustgd_browse <- function(url, title = NULL) {
 #' app both frees the terminal and clears the now dead pane from the window, so
 #' there is no separate clear step. If showing it fails, fall back to the
 #' default browser, and never let an error here interrupt `runApp()`.
+#' @noRd
 rustgd_shiny_launch <- function(url, ...) {
   tryCatch(
     {
@@ -130,6 +131,7 @@ rustgd_shiny_launch <- function(url, ...) {
 #' as `widget-NNNN/`, writes a `widget-NNNN.txt` descriptor next to it, and
 #' makes sure a webview window is running. A URL is handed to
 #' [.rustgd_push_url()] and shown in place.
+#' @noRd
 rustgd_view <- function(url, height = NULL, ...) {
   tryCatch(
     {
@@ -173,6 +175,7 @@ rustgd_view <- function(url, height = NULL, ...) {
 #' window is running. Clears any previous URL entry first (see
 #' [rustgd_browse()]) so a dead server never lingers behind a live one. Throws
 #' on failure; callers wrap as needed.
+#' @noRd
 .rustgd_push_url <- function(url, title = NULL) {
   widgets <- .rustgd_widgets_dir()
   dir.create(widgets, recursive = TRUE, showWarnings = FALSE)
@@ -196,6 +199,7 @@ rustgd_view <- function(url, height = NULL, ...) {
 #' Internal: remove every `kind=url` descriptor in the widget directory,
 #' leaving file (htmlwidget) entries in place. URL entries have only a
 #' descriptor and no bundle folder, so removing the `.txt` is enough.
+#' @noRd
 .rustgd_clear_url_descriptors <- function(widgets) {
   files <- list.files(
     widgets,
@@ -217,6 +221,7 @@ rustgd_view <- function(url, height = NULL, ...) {
 #' Internal: the next descriptor number, one past the highest existing
 #' `widget-NNNN.txt`. Numbers need only be unique among current entries, so
 #' reusing a freed number after a clear is fine.
+#' @noRd
 .rustgd_next_index <- function(widgets) {
   existing <- list.files(widgets, pattern = "^widget-[0-9]+\\.txt$")
   nums <- suppressWarnings(
@@ -229,6 +234,7 @@ rustgd_view <- function(url, height = NULL, ...) {
 #' Internal: write a descriptor atomically. Write to a temp name the viewer
 #' ignores, then rename into place so the window never reads a half-written
 #' file.
+#' @noRd
 .rustgd_write_descriptor <- function(widgets, stem, lines) {
   descriptor <- file.path(widgets, paste0(stem, ".txt"))
   tmp <- paste0(descriptor, ".tmp")
@@ -243,6 +249,7 @@ rustgd_view <- function(url, height = NULL, ...) {
 #' and no marker is present, the window is assumed open. (A crash that skips
 #' the marker is the one case this misses; re-running `use_rustgd_webview()`
 #' or displaying something else recovers.)
+#' @noRd
 rustgd_ensure_webview <- function(widgets) {
   closed <- file.path(widgets, "viewer_closed")
   running <- isTRUE(.rustgd_state$webview_dir == widgets) && !file.exists(closed)

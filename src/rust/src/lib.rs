@@ -1341,19 +1341,19 @@ fn rustgd_check_drew() -> bool {
     DREW_SOMETHING.swap(false, Ordering::SeqCst)
 }
 
-/// Toggle replay mode. R-side sets this to true before re-evaluating
-/// captured plot expressions in response to a resize, and back to false
-/// after. While true, new_page() does not advance the page counter, so
-/// the replay overwrites the existing page's file.
+// Toggle replay mode. R-side sets this to true before re-evaluating
+// captured plot expressions in response to a resize, and back to false
+// after. While true, new_page() does not advance the page counter, so
+// the replay overwrites the existing page's file.
 #[extendr]
 fn rustgd_set_replay_mode(on: bool) {
     REPLAY_IN_PROGRESS.store(on, Ordering::SeqCst);
 }
 
-/// Set the current page number directly. R-side uses this during
-/// multi-plot history replay to direct each replayed plot's flushes
-/// to a specific plot-NNNN.svg file. Only meaningful in conjunction
-/// with replay mode.
+// Set the current page number directly. R-side uses this during
+// multi-plot history replay to direct each replayed plot's flushes
+// to a specific plot-NNNN.svg file. Only meaningful in conjunction
+// with replay mode.
 #[extendr]
 fn rustgd_set_current_page(page: i32) {
     let n = if page < 0 { 0 } else { page as usize };

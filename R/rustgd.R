@@ -105,6 +105,7 @@ rustgd <- function() {
 #' Internal: tear down the rustgd session. Removes the task callback,
 #' clears state, and optionally closes the R device. Idempotent;
 #' safe to call from poll handlers that may race with manual dev.off().
+#' @noRd
 rustgd_shutdown <- function(close_device = TRUE) {
   .rustgd_state$active <- FALSE
 
@@ -299,6 +300,7 @@ rustgd_input_handler <- function() {
 #' Expressions are retained as a fallback in case recordPlot returned
 #' NULL (rare, e.g. if the user switched devices mid-expression) or
 #' replayPlot throws at replay time.
+#' @noRd
 rustgd_task_callback <- function(expr) {
   if (rustgd_check_new_page()) {
     recorded <- .rustgd_record_current()

@@ -13,16 +13,8 @@ rustgd_check_new_page <- function() .Call(wrap__rustgd_check_new_page)
 
 rustgd_check_drew <- function() .Call(wrap__rustgd_check_drew)
 
-#' Toggle replay mode. R-side sets this to true before re-evaluating
-#' captured plot expressions in response to a resize, and back to false
-#' after. While true, new_page() does not advance the page counter, so
-#' the replay overwrites the existing page's file.
 rustgd_set_replay_mode <- function(on) .Call(wrap__rustgd_set_replay_mode, on)
 
-#' Set the current page number directly. R-side uses this during
-#' multi-plot history replay to direct each replayed plot's flushes
-#' to a specific plot-NNNN.svg file. Only meaningful in conjunction
-#' with replay mode.
 rustgd_set_current_page <- function(page) .Call(wrap__rustgd_set_current_page, page)
 
 # nolint end
