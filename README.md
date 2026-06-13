@@ -30,7 +30,7 @@ rustgd registers a real R graphics device. Every `plot()`, `hist()`, base-graphi
 
 ### Data frames
 
-![mtcars in the rustgd frames window](man/figures/frames.png)
+![mtcars in the rustgd frames window](man/figures/frames.gif)
 
 `View(df)` opens a fast, scrollable table. Columns sort, resize, and filter, with a level checklist for factors, a contains box for text, and a min and max range for numeric columns; the row count updates as filters narrow the data. A Summary panel reports per-column statistics such as missing count, unique count, and a type-appropriate breakdown over what is currently shown. Every frame you view stays loaded, so paging back to an earlier one restores its sort, selection, and scroll position. The current view, filtered and in its current order, exports to Arrow or CSV.
 
