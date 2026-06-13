@@ -1,0 +1,25 @@
+Package: rustgd
+Title: Rust-Backed Graphics Device and Viewer Windows for Terminal R Sessions
+Version: 0.0.0.9000
+Authors@R: 
+    person("Jose J.", "Alcocer", email = "alcocer@protonmail.com", role = c("aut", "cre"))
+Description: Provides a Rust-backed graphics device and companion viewer
+    windows for plots, HTML widgets and live URLs, and data frames, so that
+    terminal and editor R sessions without an IDE viewer pane (such as
+    radian, Zed, or Neovim) can display graphics, htmlwidgets, Shiny apps,
+    and data frames in native windows.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.3
+Config/rextendr/version: 0.5.0
+SystemRequirements: Cargo (Rust's package manager), rustc
+Depends: 
+    R (>= 4.2)
+Imports:
+    arrow,
+    grDevices,
+    later,
+    utils
+Suggests:
+    shiny

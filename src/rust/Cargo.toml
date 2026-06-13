@@ -1,0 +1,79 @@
+[package]
+name = "rustgd"
+publish = false
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.65"
+
+[lib]
+crate-type = ["staticlib", "lib"]
+name = "rustgd"
+
+[[bin]]
+name = "document"
+path = "document.rs"
+
+[[bin]]
+name = "rustgd-viewer"
+path = "src/bin/viewer.rs"
+
+# The webview binary is gated behind the `webview` feature. Because of
+# required-features, a plain `cargo build`, the package install (`cargo build
+# --lib`), and the wrapper step (`cargo run --bin document`) all skip it, so
+# wry/tao and their WebKit binding tree never compile during an R package
+# install. Build it explicitly with:
+#   cargo build --release --bin rustgd-webview --features webview
+[[bin]]
+name = "rustgd-webview"
+path = "src/bin/rustgd-webview.rs"
+required-features = ["webview"]
+
+# The frames binary is gated behind the `frames` feature for the same reason:
+# arrow only compiles when you build it explicitly with
+#   cargo build --release --bin rustgd-frames --features frames
+[[bin]]
+name = "rustgd-frames"
+path = "src/bin/rustgd-frames.rs"
+required-features = ["frames"]
+
+[features]
+webview = ["dep:wry", "dep:tao"]
+frames = ["dep:arrow"]
+
+[dependencies]
+extendr-api = { version = "0.9.0", features = ["graphics"] }
+eframe = "0.29"
+egui = "0.29"
+# notify is declared per-platform below; its backend differs by OS.
+resvg = "0.43"
+usvg = "0.43"
+tiny-skia = "0.11"
+ttf-parser = "0.25"
+rfd = "0.14"
+png = "0.17"
+base64 = "0.22"
+arrow = { version = "55", features = ["ipc", "csv"], optional = true }
+
+
+# Webview stack, optional and only activated by the `webview` feature.
+# wry needs raw-window-handle 0.6; tao only exposes that impl under its
+# `rwh_06` feature, so it is required here. The x11 default feature is dropped
+# from wry since it pulls Linux-only crates that are irrelevant on macOS.
+wry = { version = "0.55", default-features = false, features = ["protocol", "os-webview"], optional = true }
+tao = { version = "0.35", features = ["rwh_06"], optional = true }
+
+# notify's file-watching backend is platform specific. macOS keeps the lean
+# kqueue backend; every other platform uses notify's default backend
+# (ReadDirectoryChanges on Windows, inotify on Linux).
+[target.'cfg(target_os = "macos")'.dependencies]
+notify = { version = "6", default-features = false, features = ["macos_kqueue"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+notify = "6"
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1

@@ -1,0 +1,29 @@
+
+# R session / project files
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+# macOS
+.DS_Store
+
+# Compiled artifacts (built at install time)
+*.o
+*.so
+*.a
+*.dll
+
+# Rust build tree (large; recompiled at install)
+src/rust/target/
+
+# Makevars generated from *.in by configure at install
+src/Makevars
+src/Makevars.win
+
+# Viewer binaries (compiled and staged at install, never committed)
+inst/bin/
+
+# Built source tarballs
+*.tar.gz
+*.tgz
