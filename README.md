@@ -24,7 +24,7 @@ rustgd exists to get those windows back without adopting an IDE. The rendering a
 
 ### Plots
 
-![A base R plot in the rustgd plot window](man/figures/plot-device.png)
+![Cycling through plots in the rustgd viewer](man/figures/plot-device.gif)
 
 rustgd registers a real R graphics device. Every `plot()`, `hist()`, base-graphics build-up, or printed `ggplot` renders into a dedicated window. The window keeps a gallery of every plot you draw in the session, so you can page back and forth with the toolbar or the arrow keys, zoom and pan into a plot, and export the current one to PNG or SVG. It follows your system light or dark setting, and it re-renders on resize so a plot stays sharp at any window size rather than being stretched.
 
