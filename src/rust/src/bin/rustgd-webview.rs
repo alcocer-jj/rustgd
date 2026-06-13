@@ -20,6 +20,7 @@
 //!
 //! Build:  cargo build --release --bin rustgd-webview --features webview
 //! Run:    rustgd-webview /tmp/rustgd-widgets-<pid>
+#![windows_subsystem = "windows"]
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -35,6 +35,7 @@
 //!
 //! Build:  cargo build --release --bin rustgd-frames --features frames
 //! Run:    rustgd-frames /tmp/rustgd-frames-<pid>
+#![windows_subsystem = "windows"]
 
 use arrow::array::Array;
 use arrow::csv::WriterBuilder;
@@ -42,9 +43,9 @@ use arrow::datatypes::DataType;
 use arrow::ipc::reader::FileReader;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use eframe::egui;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::File;
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -253,9 +254,7 @@ impl RustdfApp {
                 let detail = if vals.is_empty() {
                     StatDetail::Empty
                 } else {
-                    vals.sort_by(|a, b| {
-                        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                     let nn = vals.len();
                     let min = vals[0];
                     let max = vals[nn - 1];
@@ -278,16 +277,14 @@ impl RustdfApp {
                 let unique = counts.len();
                 // Checklist levels for factor and logical columns, captured
                 // before `counts` is consumed below.
-                let level_list: Option<Vec<String>> = if (types[c] == "fct"
-                    || types[c] == "lgl")
-                    && unique <= FILTER_LEVEL_CAP
-                {
-                    let mut keys: Vec<String> = counts.keys().cloned().collect();
-                    keys.sort();
-                    Some(keys)
-                } else {
-                    None
-                };
+                let level_list: Option<Vec<String>> =
+                    if (types[c] == "fct" || types[c] == "lgl") && unique <= FILTER_LEVEL_CAP {
+                        let mut keys: Vec<String> = counts.keys().cloned().collect();
+                        keys.sort();
+                        Some(keys)
+                    } else {
+                        None
+                    };
                 let detail = match types[c].as_str() {
                     "lgl" => {
                         let n_true: usize = counts
@@ -317,11 +314,8 @@ impl RustdfApp {
                         if counts.is_empty() {
                             StatDetail::Empty
                         } else {
-                            let mut pairs: Vec<(String, usize)> =
-                                counts.into_iter().collect();
-                            pairs.sort_by(|a, b| {
-                                b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))
-                            });
+                            let mut pairs: Vec<(String, usize)> = counts.into_iter().collect();
+                            pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
                             let other: usize =
                                 pairs.iter().skip(CAT_LIST_CAP).map(|(_, c)| *c).sum();
                             pairs.truncate(CAT_LIST_CAP);
@@ -466,9 +460,7 @@ impl RustdfApp {
                 }
                 FilterState::Numeric { text, min, max } => {
                     let cell = self.cell_for_sort(row, c);
-                    if !text.is_empty()
-                        && !cell.to_lowercase().contains(&text.to_lowercase())
-                    {
+                    if !text.is_empty() && !cell.to_lowercase().contains(&text.to_lowercase()) {
                         return false;
                     }
                     let lo = min.trim().parse::<f64>().ok();
@@ -555,9 +547,7 @@ impl RustdfApp {
                 StatDetail::Empty
             } else {
                 let mut vals = num_values;
-                vals.sort_by(|a, b| {
-                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 let nn = vals.len();
                 let min = vals[0];
                 let max = vals[nn - 1];
@@ -610,13 +600,9 @@ impl RustdfApp {
                     if cat_counts.is_empty() {
                         StatDetail::Empty
                     } else {
-                        let mut pairs: Vec<(String, usize)> =
-                            cat_counts.into_iter().collect();
-                        pairs.sort_by(|a, b| {
-                            b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))
-                        });
-                        let other: usize =
-                            pairs.iter().skip(CAT_LIST_CAP).map(|(_, c)| *c).sum();
+                        let mut pairs: Vec<(String, usize)> = cat_counts.into_iter().collect();
+                        pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                        let other: usize = pairs.iter().skip(CAT_LIST_CAP).map(|(_, c)| *c).sum();
                         pairs.truncate(CAT_LIST_CAP);
                         StatDetail::Categorical { top: pairs, other }
                     }
@@ -841,586 +827,552 @@ impl RustdfApp {
         let mut filter_change: Option<(usize, FilterState)> = None;
 
         let new_offset = {
-                if preview {
-                    ui.label(format!(
-                        "showing {} of {} rows × {} columns  ·  preview",
-                        nrows, full_rows, ncols
-                    ));
-                } else if filter_active {
-                    ui.label(format!(
-                        "showing {} of {} rows × {} columns  ·  filtered",
-                        visible, nrows, ncols
-                    ));
-                } else {
-                    ui.label(format!("{} rows × {} columns", nrows, ncols));
+            if preview {
+                ui.label(format!(
+                    "showing {} of {} rows × {} columns  ·  preview",
+                    nrows, full_rows, ncols
+                ));
+            } else if filter_active {
+                ui.label(format!(
+                    "showing {} of {} rows × {} columns  ·  filtered",
+                    visible, nrows, ncols
+                ));
+            } else {
+                ui.label(format!("{} rows × {} columns", nrows, ncols));
+            }
+            ui.separator();
+
+            let full = ui.available_rect_before_wrap();
+            let index_rect = egui::Rect::from_min_max(
+                full.min,
+                egui::pos2(full.left() + INDEX_W, full.bottom()),
+            );
+            let data_rect =
+                egui::Rect::from_min_max(egui::pos2(full.left() + INDEX_W, full.top()), full.max);
+
+            // ---- LEFT: frozen index column ----
+            let mut index_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(index_rect)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            {
+                let ui = &mut index_ui;
+                ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                let (corner, _) =
+                    ui.allocate_exact_size(egui::vec2(INDEX_W, HEADER_H), egui::Sense::hover());
+                ui.painter().rect_filled(corner, 0.0, header_bg);
+                ui.painter().rect_stroke(corner, 0.0, grid_stroke);
+                if matches!(selection, Selection::Column(0)) {
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(corner.right(), corner.top()),
+                            egui::pos2(corner.right(), corner.bottom()),
+                        ],
+                        sel_stroke,
+                    );
                 }
-                ui.separator();
 
-                let full = ui.available_rect_before_wrap();
-                let index_rect = egui::Rect::from_min_max(
-                    full.min,
-                    egui::pos2(full.left() + INDEX_W, full.bottom()),
-                );
-                let data_rect = egui::Rect::from_min_max(
-                    egui::pos2(full.left() + INDEX_W, full.top()),
-                    full.max,
-                );
+                egui::ScrollArea::vertical()
+                    .id_salt(("idx_v", id))
+                    .auto_shrink([true, false])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .vertical_scroll_offset(mirror)
+                    .show_rows(ui, ROW_H, visible, |ui, row_range| {
+                        ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                        let mut idx_sel_rects: Vec<egui::Rect> = Vec::new();
+                        let mut idx_right_lines: Vec<egui::Rect> = Vec::new();
+                        for r in row_range {
+                            let orig = if order.is_empty() { r } else { order[r] };
+                            let (rect, resp) = ui.allocate_exact_size(
+                                egui::vec2(INDEX_W, ROW_H),
+                                egui::Sense::click(),
+                            );
+                            let row_selected =
+                                matches!(selection, Selection::Row(sr) if sr == orig);
+                            let right_selected = matches!(selection, Selection::Column(0))
+                                || matches!(selection, Selection::Cell(scr, 0) if scr == orig);
+                            ui.painter().rect_filled(rect, 0.0, index_bg);
+                            if row_selected {
+                                ui.painter().rect_filled(rect, 0.0, sel_fill);
+                                idx_sel_rects.push(rect);
+                            } else if right_selected {
+                                idx_right_lines.push(rect);
+                            }
+                            ui.painter().rect_stroke(rect, 0.0, grid_stroke);
+                            draw_text(
+                                ui,
+                                rect,
+                                &(orig + 1).to_string(),
+                                text_white,
+                                13.0,
+                                egui::Align2::CENTER_CENTER,
+                                true,
+                            );
+                            if resp.clicked() {
+                                clicked_index = Some(orig);
+                            }
+                        }
+                        for r in &idx_sel_rects {
+                            ui.painter().rect_stroke(*r, 0.0, sel_stroke);
+                        }
+                        for r in &idx_right_lines {
+                            ui.painter().line_segment(
+                                [
+                                    egui::pos2(r.right(), r.top()),
+                                    egui::pos2(r.right(), r.bottom()),
+                                ],
+                                sel_stroke,
+                            );
+                        }
+                    });
+            }
 
-                // ---- LEFT: frozen index column ----
-                let mut index_ui = ui.new_child(
-                    egui::UiBuilder::new()
-                        .max_rect(index_rect)
-                        .layout(egui::Layout::top_down(egui::Align::Min)),
-                );
-                {
-                    let ui = &mut index_ui;
-                    ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
-                    let (corner, _) =
-                        ui.allocate_exact_size(egui::vec2(INDEX_W, HEADER_H), egui::Sense::hover());
-                    ui.painter().rect_filled(corner, 0.0, header_bg);
-                    ui.painter().rect_stroke(corner, 0.0, grid_stroke);
-                    if matches!(selection, Selection::Column(0)) {
-                        ui.painter().line_segment(
-                            [
-                                egui::pos2(corner.right(), corner.top()),
-                                egui::pos2(corner.right(), corner.bottom()),
-                            ],
-                            sel_stroke,
-                        );
-                    }
-
-                    egui::ScrollArea::vertical()
-                        .id_salt(("idx_v", id))
-                        .auto_shrink([true, false])
-                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                        .vertical_scroll_offset(mirror)
-                        .show_rows(ui, ROW_H, visible, |ui, row_range| {
+            // ---- RIGHT: data ----
+            let mut data_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(data_rect)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            data_ui.set_clip_rect(data_rect);
+            let new_offset = {
+                let ui = &mut data_ui;
+                egui::ScrollArea::horizontal()
+                    .id_salt(("data_h", id))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
-                            let mut idx_sel_rects: Vec<egui::Rect> = Vec::new();
-                            let mut idx_right_lines: Vec<egui::Rect> = Vec::new();
-                            for r in row_range {
-                                let orig = if order.is_empty() { r } else { order[r] };
-                                let (rect, resp) = ui.allocate_exact_size(
-                                    egui::vec2(INDEX_W, ROW_H),
-                                    egui::Sense::click(),
-                                );
-                                let row_selected =
-                                    matches!(selection, Selection::Row(sr) if sr == orig);
-                                let right_selected = matches!(selection, Selection::Column(0))
-                                    || matches!(selection, Selection::Cell(scr, 0) if scr == orig);
-                                ui.painter().rect_filled(rect, 0.0, index_bg);
-                                if row_selected {
-                                    ui.painter().rect_filled(rect, 0.0, sel_fill);
-                                    idx_sel_rects.push(rect);
-                                } else if right_selected {
-                                    idx_right_lines.push(rect);
-                                }
-                                ui.painter().rect_stroke(rect, 0.0, grid_stroke);
-                                draw_text(
-                                    ui,
-                                    rect,
-                                    &(orig + 1).to_string(),
-                                    text_white,
-                                    13.0,
-                                    egui::Align2::CENTER_CENTER,
-                                    true,
-                                );
-                                if resp.clicked() {
-                                    clicked_index = Some(orig);
-                                }
-                            }
-                            for r in &idx_sel_rects {
-                                ui.painter().rect_stroke(*r, 0.0, sel_stroke);
-                            }
-                            for r in &idx_right_lines {
-                                ui.painter().line_segment(
-                                    [
-                                        egui::pos2(r.right(), r.top()),
-                                        egui::pos2(r.right(), r.bottom()),
-                                    ],
-                                    sel_stroke,
-                                );
-                            }
-                        });
-                }
 
-                // ---- RIGHT: data ----
-                let mut data_ui = ui.new_child(
-                    egui::UiBuilder::new()
-                        .max_rect(data_rect)
-                        .layout(egui::Layout::top_down(egui::Align::Min)),
-                );
-                data_ui.set_clip_rect(data_rect);
-                let new_offset = {
-                    let ui = &mut data_ui;
-                    egui::ScrollArea::horizontal()
-                        .id_salt(("data_h", id))
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.vertical(|ui| {
+                            // header row
+                            ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                                let mut hdr_sel_rects: Vec<egui::Rect> = Vec::new();
+                                for c in 0..ncols {
+                                    let w = widths[c];
+                                    let (rect, resp) = ui.allocate_exact_size(
+                                        egui::vec2(w, HEADER_H),
+                                        egui::Sense::click(),
+                                    );
+                                    let col_selected =
+                                        matches!(selection, Selection::Column(sc) if sc == c);
+                                    let bg = if resp.hovered() {
+                                        header_hover
+                                    } else {
+                                        header_bg
+                                    };
+                                    ui.painter().rect_filled(rect, 0.0, bg);
+                                    if col_selected {
+                                        ui.painter().rect_filled(rect, 0.0, sel_fill);
+                                        hdr_sel_rects.push(rect);
+                                    }
+                                    ui.painter().rect_stroke(rect, 0.0, grid_stroke);
 
-                                // header row
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
-                                    let mut hdr_sel_rects: Vec<egui::Rect> = Vec::new();
-                                    for c in 0..ncols {
-                                        let w = widths[c];
-                                        let (rect, resp) = ui.allocate_exact_size(
-                                            egui::vec2(w, HEADER_H),
-                                            egui::Sense::click(),
-                                        );
-                                        let col_selected =
-                                            matches!(selection, Selection::Column(sc) if sc == c);
-                                        let bg = if resp.hovered() {
-                                            header_hover
-                                        } else {
-                                            header_bg
-                                        };
-                                        ui.painter().rect_filled(rect, 0.0, bg);
-                                        if col_selected {
-                                            ui.painter().rect_filled(rect, 0.0, sel_fill);
-                                            hdr_sel_rects.push(rect);
-                                        }
-                                        ui.painter().rect_stroke(rect, 0.0, grid_stroke);
+                                    let label_w = (w - 40.0).max(0.0);
+                                    let name_rect = egui::Rect::from_min_size(
+                                        rect.min,
+                                        egui::vec2(label_w, HEADER_H * 0.6),
+                                    );
+                                    let type_rect = egui::Rect::from_min_size(
+                                        egui::pos2(rect.left(), rect.top() + HEADER_H * 0.6),
+                                        egui::vec2(label_w, HEADER_H * 0.4),
+                                    );
+                                    draw_text_bold(
+                                        ui,
+                                        name_rect,
+                                        &headers[c],
+                                        text_header,
+                                        14.0,
+                                        egui::Align2::LEFT_CENTER,
+                                    );
+                                    draw_text(
+                                        ui,
+                                        type_rect,
+                                        &types[c],
+                                        text_white,
+                                        11.0,
+                                        egui::Align2::LEFT_CENTER,
+                                        false,
+                                    );
 
-                                        let label_w = (w - 40.0).max(0.0);
-                                        let name_rect = egui::Rect::from_min_size(
-                                            rect.min,
-                                            egui::vec2(label_w, HEADER_H * 0.6),
-                                        );
-                                        let type_rect = egui::Rect::from_min_size(
-                                            egui::pos2(rect.left(), rect.top() + HEADER_H * 0.6),
-                                            egui::vec2(label_w, HEADER_H * 0.4),
-                                        );
-                                        draw_text_bold(
+                                    if sort_col == Some(c) {
+                                        let cx = rect.right() - 36.0;
+                                        let cy = rect.top() + HEADER_H * 0.50;
+                                        draw_sort_arrow(
                                             ui,
-                                            name_rect,
-                                            &headers[c],
-                                            text_header,
-                                            14.0,
-                                            egui::Align2::LEFT_CENTER,
+                                            egui::pos2(cx, cy),
+                                            sort_dir == SortDir::Asc,
+                                            accent,
                                         );
-                                        draw_text(
-                                            ui,
-                                            type_rect,
-                                            &types[c],
-                                            text_white,
-                                            11.0,
-                                            egui::Align2::LEFT_CENTER,
-                                            false,
-                                        );
+                                    }
 
-                                        if sort_col == Some(c) {
-                                            let cx = rect.right() - 36.0;
-                                            let cy = rect.top() + HEADER_H * 0.50;
-                                            draw_sort_arrow(
-                                                ui,
-                                                egui::pos2(cx, cy),
-                                                sort_dir == SortDir::Asc,
-                                                accent,
-                                            );
-                                        }
+                                    let dots_rect = egui::Rect::from_min_max(
+                                        egui::pos2(rect.right() - 28.0, rect.top()),
+                                        egui::pos2(rect.right() - 4.0, rect.bottom()),
+                                    );
+                                    let dots_resp = ui.interact(
+                                        dots_rect,
+                                        egui::Id::new(("rustdf_dots", id, c)),
+                                        egui::Sense::click(),
+                                    );
+                                    let dots_color = if dots_resp.hovered() {
+                                        dots_hover_color
+                                    } else {
+                                        accent
+                                    };
+                                    let dcx = dots_rect.center().x;
+                                    let dcy = dots_rect.center().y;
+                                    let dot_r = 1.5;
+                                    let dot_s = 4.0;
+                                    ui.painter().circle_filled(
+                                        egui::pos2(dcx, dcy - dot_s),
+                                        dot_r,
+                                        dots_color,
+                                    );
+                                    ui.painter().circle_filled(
+                                        egui::pos2(dcx, dcy),
+                                        dot_r,
+                                        dots_color,
+                                    );
+                                    ui.painter().circle_filled(
+                                        egui::pos2(dcx, dcy + dot_s),
+                                        dot_r,
+                                        dots_color,
+                                    );
 
-                                        let dots_rect = egui::Rect::from_min_max(
-                                            egui::pos2(rect.right() - 28.0, rect.top()),
-                                            egui::pos2(rect.right() - 4.0, rect.bottom()),
-                                        );
-                                        let dots_resp = ui.interact(
-                                            dots_rect,
-                                            egui::Id::new(("rustdf_dots", id, c)),
-                                            egui::Sense::click(),
-                                        );
-                                        let dots_color = if dots_resp.hovered() {
-                                            dots_hover_color
-                                        } else {
-                                            accent
-                                        };
-                                        let dcx = dots_rect.center().x;
-                                        let dcy = dots_rect.center().y;
-                                        let dot_r = 1.5;
-                                        let dot_s = 4.0;
-                                        ui.painter().circle_filled(
-                                            egui::pos2(dcx, dcy - dot_s),
-                                            dot_r,
-                                            dots_color,
-                                        );
-                                        ui.painter()
-                                            .circle_filled(egui::pos2(dcx, dcy), dot_r, dots_color);
-                                        ui.painter().circle_filled(
-                                            egui::pos2(dcx, dcy + dot_s),
-                                            dot_r,
-                                            dots_color,
-                                        );
+                                    if dots_resp.clicked() {
+                                        clicked_dots = Some(c);
+                                    } else if resp.clicked() {
+                                        clicked_col = Some(c);
+                                    }
 
-                                        if dots_resp.clicked() {
-                                            clicked_dots = Some(c);
-                                        } else if resp.clicked() {
-                                            clicked_col = Some(c);
-                                        }
+                                    let popup_id = egui::Id::new(("rustdf_menu", id, c));
+                                    let is_sorted = sort_col == Some(c);
+                                    egui::popup::popup_below_widget(
+                                        ui,
+                                        popup_id,
+                                        &dots_resp,
+                                        egui::PopupCloseBehavior::CloseOnClickOutside,
+                                        |ui| {
+                                            ui.set_min_width(180.0);
+                                            if ui
+                                                .add_enabled(true, egui::Button::new("Copy Column"))
+                                                .clicked()
+                                            {
+                                                menu_action = Some((c, MenuAction::Copy));
+                                                ui.memory_mut(|m| m.close_popup());
+                                            }
+                                            ui.separator();
+                                            if ui
+                                                .add_enabled(
+                                                    true,
+                                                    egui::Button::new("Sort Ascending"),
+                                                )
+                                                .clicked()
+                                            {
+                                                menu_action = Some((c, MenuAction::SortAsc));
+                                                ui.memory_mut(|m| m.close_popup());
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    true,
+                                                    egui::Button::new("Sort Descending"),
+                                                )
+                                                .clicked()
+                                            {
+                                                menu_action = Some((c, MenuAction::SortDesc));
+                                                ui.memory_mut(|m| m.close_popup());
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    is_sorted,
+                                                    egui::Button::new("Clear Sorting"),
+                                                )
+                                                .clicked()
+                                            {
+                                                menu_action = Some((c, MenuAction::ClearSort));
+                                                ui.memory_mut(|m| m.close_popup());
+                                            }
 
-                                        let popup_id = egui::Id::new(("rustdf_menu", id, c));
-                                        let is_sorted = sort_col == Some(c);
-                                        egui::popup::popup_below_widget(
-                                            ui,
-                                            popup_id,
-                                            &dots_resp,
-                                            egui::PopupCloseBehavior::CloseOnClickOutside,
-                                            |ui| {
-                                                ui.set_min_width(180.0);
-                                                if ui
-                                                    .add_enabled(
-                                                        true,
-                                                        egui::Button::new("Copy Column"),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    menu_action = Some((c, MenuAction::Copy));
-                                                    ui.memory_mut(|m| m.close_popup());
-                                                }
-                                                ui.separator();
-                                                if ui
-                                                    .add_enabled(
-                                                        true,
-                                                        egui::Button::new("Sort Ascending"),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    menu_action = Some((c, MenuAction::SortAsc));
-                                                    ui.memory_mut(|m| m.close_popup());
-                                                }
-                                                if ui
-                                                    .add_enabled(
-                                                        true,
-                                                        egui::Button::new("Sort Descending"),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    menu_action = Some((c, MenuAction::SortDesc));
-                                                    ui.memory_mut(|m| m.close_popup());
-                                                }
-                                                if ui
-                                                    .add_enabled(
-                                                        is_sorted,
-                                                        egui::Button::new("Clear Sorting"),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    menu_action = Some((c, MenuAction::ClearSort));
-                                                    ui.memory_mut(|m| m.close_popup());
-                                                }
-
-                                                ui.separator();
-                                                ui.label(
-                                                    egui::RichText::new("Filter").strong(),
-                                                );
-                                                let current = &filters[c];
-                                                match &levels[c] {
-                                                    Some(level_list) => {
-                                                        // Checklist for factor and
-                                                        // logical columns.
-                                                        let mut selected: HashSet<String> =
-                                                            match current {
-                                                                FilterState::Levels(s) => {
-                                                                    s.clone()
-                                                                }
-                                                                _ => level_list
-                                                                    .iter()
-                                                                    .cloned()
-                                                                    .collect(),
-                                                            };
-                                                        let mut changed = false;
-                                                        ui.horizontal(|ui| {
-                                                            if ui.button("All").clicked() {
-                                                                selected = level_list
-                                                                    .iter()
-                                                                    .cloned()
-                                                                    .collect();
-                                                                changed = true;
+                                            ui.separator();
+                                            ui.label(egui::RichText::new("Filter").strong());
+                                            let current = &filters[c];
+                                            match &levels[c] {
+                                                Some(level_list) => {
+                                                    // Checklist for factor and
+                                                    // logical columns.
+                                                    let mut selected: HashSet<String> =
+                                                        match current {
+                                                            FilterState::Levels(s) => s.clone(),
+                                                            _ => {
+                                                                level_list.iter().cloned().collect()
                                                             }
-                                                            if ui.button("None").clicked() {
-                                                                selected.clear();
-                                                                changed = true;
+                                                        };
+                                                    let mut changed = false;
+                                                    ui.horizontal(|ui| {
+                                                        if ui.button("All").clicked() {
+                                                            selected = level_list
+                                                                .iter()
+                                                                .cloned()
+                                                                .collect();
+                                                            changed = true;
+                                                        }
+                                                        if ui.button("None").clicked() {
+                                                            selected.clear();
+                                                            changed = true;
+                                                        }
+                                                    });
+                                                    egui::ScrollArea::vertical()
+                                                        .max_height(200.0)
+                                                        .id_salt(("filter_levels", id, c))
+                                                        .show(ui, |ui| {
+                                                            for lvl in level_list {
+                                                                let mut on = selected.contains(lvl);
+                                                                if ui
+                                                                    .checkbox(&mut on, lvl.as_str())
+                                                                    .changed()
+                                                                {
+                                                                    if on {
+                                                                        selected
+                                                                            .insert(lvl.clone());
+                                                                    } else {
+                                                                        selected.remove(lvl);
+                                                                    }
+                                                                    changed = true;
+                                                                }
                                                             }
                                                         });
-                                                        egui::ScrollArea::vertical()
-                                                            .max_height(200.0)
-                                                            .id_salt((
-                                                                "filter_levels",
-                                                                id,
-                                                                c,
-                                                            ))
-                                                            .show(ui, |ui| {
-                                                                for lvl in level_list {
-                                                                    let mut on = selected
-                                                                        .contains(lvl);
-                                                                    if ui
-                                                                        .checkbox(
-                                                                            &mut on,
-                                                                            lvl.as_str(),
-                                                                        )
-                                                                        .changed()
-                                                                    {
-                                                                        if on {
-                                                                            selected.insert(
-                                                                                lvl.clone(),
-                                                                            );
-                                                                        } else {
-                                                                            selected
-                                                                                .remove(lvl);
-                                                                        }
-                                                                        changed = true;
-                                                                    }
-                                                                }
-                                                            });
-                                                        if changed {
-                                                            // All levels selected means
-                                                            // no effective filter.
-                                                            filter_change = Some((
-                                                                c,
-                                                                if selected.len()
-                                                                    == level_list.len()
-                                                                {
-                                                                    FilterState::None
-                                                                } else {
-                                                                    FilterState::Levels(
-                                                                        selected,
-                                                                    )
-                                                                },
-                                                            ));
-                                                        }
+                                                    if changed {
+                                                        // All levels selected means
+                                                        // no effective filter.
+                                                        filter_change = Some((
+                                                            c,
+                                                            if selected.len() == level_list.len() {
+                                                                FilterState::None
+                                                            } else {
+                                                                FilterState::Levels(selected)
+                                                            },
+                                                        ));
                                                     }
-                                                    None => {
-                                                        if numeric[c] {
-                                                            // Numeric: contains plus
-                                                            // optional min/max range.
-                                                            let (ct, cmin, cmax) =
-                                                                match current {
-                                                                    FilterState::Numeric {
-                                                                        text,
-                                                                        min,
-                                                                        max,
-                                                                    } => (
-                                                                        text.clone(),
-                                                                        min.clone(),
-                                                                        max.clone(),
-                                                                    ),
-                                                                    FilterState::Text(t) => (
-                                                                        t.clone(),
-                                                                        String::new(),
-                                                                        String::new(),
-                                                                    ),
-                                                                    _ => (
-                                                                        String::new(),
-                                                                        String::new(),
-                                                                        String::new(),
-                                                                    ),
-                                                                };
-                                                            let mut text = ct;
-                                                            let mut min_str = cmin;
-                                                            let mut max_str = cmax;
-                                                            let mut changed = false;
-                                                            if ui
-                                                                .add(
-                                                                    egui::TextEdit::singleline(
-                                                                        &mut text,
-                                                                    )
-                                                                    .hint_text("contains...")
-                                                                    .desired_width(160.0),
-                                                                )
-                                                                .changed()
-                                                            {
-                                                                changed = true;
-                                                            }
-                                                            ui.horizontal(|ui| {
-                                                                ui.label("min");
-                                                                if ui
-                                                                    .add(
-                                                                        egui::TextEdit::singleline(
-                                                                            &mut min_str,
-                                                                        )
-                                                                        .desired_width(64.0),
-                                                                    )
-                                                                    .changed()
-                                                                {
-                                                                    changed = true;
-                                                                }
-                                                                ui.label("max");
-                                                                if ui
-                                                                    .add(
-                                                                        egui::TextEdit::singleline(
-                                                                            &mut max_str,
-                                                                        )
-                                                                        .desired_width(64.0),
-                                                                    )
-                                                                    .changed()
-                                                                {
-                                                                    changed = true;
-                                                                }
-                                                            });
-                                                            if changed {
-                                                                let empty = text.is_empty()
-                                                                    && min_str.trim().is_empty()
-                                                                    && max_str.trim().is_empty();
-                                                                filter_change = Some((
-                                                                    c,
-                                                                    if empty {
-                                                                        FilterState::None
-                                                                    } else {
-                                                                        FilterState::Numeric {
-                                                                            text,
-                                                                            min: min_str,
-                                                                            max: max_str,
-                                                                        }
-                                                                    },
-                                                                ));
-                                                            }
-                                                        } else {
-                                                            // Text "contains" for
-                                                            // character and date columns.
-                                                            let current_text = match current {
-                                                                FilterState::Text(t) => {
-                                                                    t.clone()
-                                                                }
-                                                                _ => String::new(),
-                                                            };
-                                                            let mut text =
-                                                                current_text.clone();
-                                                            let resp = ui.add(
+                                                }
+                                                None => {
+                                                    if numeric[c] {
+                                                        // Numeric: contains plus
+                                                        // optional min/max range.
+                                                        let (ct, cmin, cmax) = match current {
+                                                            FilterState::Numeric {
+                                                                text,
+                                                                min,
+                                                                max,
+                                                            } => (
+                                                                text.clone(),
+                                                                min.clone(),
+                                                                max.clone(),
+                                                            ),
+                                                            FilterState::Text(t) => (
+                                                                t.clone(),
+                                                                String::new(),
+                                                                String::new(),
+                                                            ),
+                                                            _ => (
+                                                                String::new(),
+                                                                String::new(),
+                                                                String::new(),
+                                                            ),
+                                                        };
+                                                        let mut text = ct;
+                                                        let mut min_str = cmin;
+                                                        let mut max_str = cmax;
+                                                        let mut changed = false;
+                                                        if ui
+                                                            .add(
                                                                 egui::TextEdit::singleline(
                                                                     &mut text,
                                                                 )
                                                                 .hint_text("contains...")
                                                                 .desired_width(160.0),
-                                                            );
-                                                            if resp.changed() {
-                                                                filter_change = Some((
-                                                                    c,
-                                                                    if text.is_empty() {
-                                                                        FilterState::None
-                                                                    } else {
-                                                                        FilterState::Text(text)
-                                                                    },
-                                                                ));
+                                                            )
+                                                            .changed()
+                                                        {
+                                                            changed = true;
+                                                        }
+                                                        ui.horizontal(|ui| {
+                                                            ui.label("min");
+                                                            if ui
+                                                                .add(
+                                                                    egui::TextEdit::singleline(
+                                                                        &mut min_str,
+                                                                    )
+                                                                    .desired_width(64.0),
+                                                                )
+                                                                .changed()
+                                                            {
+                                                                changed = true;
                                                             }
+                                                            ui.label("max");
+                                                            if ui
+                                                                .add(
+                                                                    egui::TextEdit::singleline(
+                                                                        &mut max_str,
+                                                                    )
+                                                                    .desired_width(64.0),
+                                                                )
+                                                                .changed()
+                                                            {
+                                                                changed = true;
+                                                            }
+                                                        });
+                                                        if changed {
+                                                            let empty = text.is_empty()
+                                                                && min_str.trim().is_empty()
+                                                                && max_str.trim().is_empty();
+                                                            filter_change = Some((
+                                                                c,
+                                                                if empty {
+                                                                    FilterState::None
+                                                                } else {
+                                                                    FilterState::Numeric {
+                                                                        text,
+                                                                        min: min_str,
+                                                                        max: max_str,
+                                                                    }
+                                                                },
+                                                            ));
+                                                        }
+                                                    } else {
+                                                        // Text "contains" for
+                                                        // character and date columns.
+                                                        let current_text = match current {
+                                                            FilterState::Text(t) => t.clone(),
+                                                            _ => String::new(),
+                                                        };
+                                                        let mut text = current_text.clone();
+                                                        let resp = ui.add(
+                                                            egui::TextEdit::singleline(&mut text)
+                                                                .hint_text("contains...")
+                                                                .desired_width(160.0),
+                                                        );
+                                                        if resp.changed() {
+                                                            filter_change = Some((
+                                                                c,
+                                                                if text.is_empty() {
+                                                                    FilterState::None
+                                                                } else {
+                                                                    FilterState::Text(text)
+                                                                },
+                                                            ));
                                                         }
                                                     }
                                                 }
-                                                if !matches!(current, FilterState::None)
-                                                    && ui.button("Clear filter").clicked()
-                                                {
-                                                    filter_change =
-                                                        Some((c, FilterState::None));
-                                                    ui.memory_mut(|m| m.close_popup());
-                                                }
-                                            },
-                                        );
+                                            }
+                                            if !matches!(current, FilterState::None)
+                                                && ui.button("Clear filter").clicked()
+                                            {
+                                                filter_change = Some((c, FilterState::None));
+                                                ui.memory_mut(|m| m.close_popup());
+                                            }
+                                        },
+                                    );
 
-                                        let handle = egui::Rect::from_min_max(
-                                            egui::pos2(rect.right() - 4.0, rect.top()),
-                                            egui::pos2(rect.right() + 4.0, rect.bottom()),
+                                    let handle = egui::Rect::from_min_max(
+                                        egui::pos2(rect.right() - 4.0, rect.top()),
+                                        egui::pos2(rect.right() + 4.0, rect.bottom()),
+                                    );
+                                    let rresp = ui.interact(
+                                        handle,
+                                        egui::Id::new(("rustdf_resize", id, c)),
+                                        egui::Sense::drag(),
+                                    );
+                                    if rresp.hovered() || rresp.dragged() {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
+                                        let line = egui::Rect::from_min_max(
+                                            egui::pos2(rect.right() - 1.0, rect.top()),
+                                            egui::pos2(rect.right() + 1.0, rect.bottom()),
                                         );
-                                        let rresp = ui.interact(
-                                            handle,
-                                            egui::Id::new(("rustdf_resize", id, c)),
-                                            egui::Sense::drag(),
-                                        );
-                                        if rresp.hovered() || rresp.dragged() {
-                                            ui.ctx()
-                                                .set_cursor_icon(egui::CursorIcon::ResizeColumn);
-                                            let line = egui::Rect::from_min_max(
-                                                egui::pos2(rect.right() - 1.0, rect.top()),
-                                                egui::pos2(rect.right() + 1.0, rect.bottom()),
-                                            );
-                                            ui.painter().rect_filled(line, 0.0, accent);
-                                        }
-                                        if rresp.dragged() {
-                                            deltas[c] += rresp.drag_delta().x;
-                                        }
+                                        ui.painter().rect_filled(line, 0.0, accent);
                                     }
-                                    for r in &hdr_sel_rects {
+                                    if rresp.dragged() {
+                                        deltas[c] += rresp.drag_delta().x;
+                                    }
+                                }
+                                for r in &hdr_sel_rects {
+                                    ui.painter().rect_stroke(*r, 0.0, sel_stroke);
+                                }
+                            });
+
+                            // data body
+                            let out = egui::ScrollArea::vertical()
+                                .id_salt(("data_v", id))
+                                .auto_shrink([true, false])
+                                .scroll_bar_visibility(
+                                    egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                )
+                                .show_rows(ui, ROW_H, visible, |ui, row_range| {
+                                    ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                                    let mut data_sel_rects: Vec<egui::Rect> = Vec::new();
+                                    for r in row_range {
+                                        let orig = if order.is_empty() { r } else { order[r] };
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                                            for c in 0..ncols {
+                                                let w = widths[c];
+                                                let (rect, resp) = ui.allocate_exact_size(
+                                                    egui::vec2(w, ROW_H),
+                                                    egui::Sense::click(),
+                                                );
+                                                let (this_fill, this_border) = match selection {
+                                                    Selection::Column(sc) if sc == c => {
+                                                        (true, true)
+                                                    }
+                                                    Selection::Row(sr) if sr == orig => {
+                                                        (true, true)
+                                                    }
+                                                    Selection::Cell(scr, scc)
+                                                        if scr == orig && scc == c =>
+                                                    {
+                                                        (false, true)
+                                                    }
+                                                    _ => (false, false),
+                                                };
+                                                if this_fill {
+                                                    ui.painter().rect_filled(rect, 0.0, sel_fill);
+                                                }
+                                                ui.painter().rect_stroke(rect, 0.0, grid_stroke);
+                                                if this_border {
+                                                    data_sel_rects.push(rect);
+                                                }
+                                                let val = rows
+                                                    .get(orig)
+                                                    .and_then(|row| row.get(c))
+                                                    .map(|s| s.as_str())
+                                                    .unwrap_or("");
+                                                let align = if numeric[c] {
+                                                    egui::Align2::RIGHT_CENTER
+                                                } else {
+                                                    egui::Align2::LEFT_CENTER
+                                                };
+                                                let color =
+                                                    if val == "NA" { text_na } else { text_data };
+                                                draw_text(ui, rect, val, color, 13.0, align, true);
+                                                if resp.clicked() {
+                                                    clicked_cell = Some((orig, c));
+                                                }
+                                            }
+                                        });
+                                    }
+                                    for r in &data_sel_rects {
                                         ui.painter().rect_stroke(*r, 0.0, sel_stroke);
                                     }
                                 });
-
-                                // data body
-                                let out = egui::ScrollArea::vertical()
-                                    .id_salt(("data_v", id))
-                                    .auto_shrink([true, false])
-                                    .scroll_bar_visibility(
-                                        egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
-                                    )
-                                    .show_rows(ui, ROW_H, visible, |ui, row_range| {
-                                        ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
-                                        let mut data_sel_rects: Vec<egui::Rect> = Vec::new();
-                                        for r in row_range {
-                                            let orig = if order.is_empty() { r } else { order[r] };
-                                            ui.horizontal(|ui| {
-                                                ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
-                                                for c in 0..ncols {
-                                                    let w = widths[c];
-                                                    let (rect, resp) = ui.allocate_exact_size(
-                                                        egui::vec2(w, ROW_H),
-                                                        egui::Sense::click(),
-                                                    );
-                                                    let (this_fill, this_border) = match selection {
-                                                        Selection::Column(sc) if sc == c => {
-                                                            (true, true)
-                                                        }
-                                                        Selection::Row(sr) if sr == orig => {
-                                                            (true, true)
-                                                        }
-                                                        Selection::Cell(scr, scc)
-                                                            if scr == orig && scc == c =>
-                                                        {
-                                                            (false, true)
-                                                        }
-                                                        _ => (false, false),
-                                                    };
-                                                    if this_fill {
-                                                        ui.painter().rect_filled(rect, 0.0, sel_fill);
-                                                    }
-                                                    ui.painter().rect_stroke(rect, 0.0, grid_stroke);
-                                                    if this_border {
-                                                        data_sel_rects.push(rect);
-                                                    }
-                                                    let val = rows
-                                                        .get(orig)
-                                                        .and_then(|row| row.get(c))
-                                                        .map(|s| s.as_str())
-                                                        .unwrap_or("");
-                                                    let align = if numeric[c] {
-                                                        egui::Align2::RIGHT_CENTER
-                                                    } else {
-                                                        egui::Align2::LEFT_CENTER
-                                                    };
-                                                    let color = if val == "NA" {
-                                                        text_na
-                                                    } else {
-                                                        text_data
-                                                    };
-                                                    draw_text(
-                                                        ui, rect, val, color, 13.0, align, true,
-                                                    );
-                                                    if resp.clicked() {
-                                                        clicked_cell = Some((orig, c));
-                                                    }
-                                                }
-                                            });
-                                        }
-                                        for r in &data_sel_rects {
-                                            ui.painter().rect_stroke(*r, 0.0, sel_stroke);
-                                        }
-                                    });
-                                out.state.offset.y
-                            })
-                            .inner
+                            out.state.offset.y
                         })
                         .inner
-                };
-                ui.painter()
-                    .hline(full.left()..=full.right(), full.top() + 0.5, grid_stroke);
-                new_offset
+                    })
+                    .inner
+            };
+            ui.painter()
+                .hline(full.left()..=full.right(), full.top() + 0.5, grid_stroke);
+            new_offset
         };
 
         let mut changed = false;
@@ -1686,21 +1638,13 @@ impl eframe::App for GalleryApp {
                     }
                     if let Some((vis, tot)) = row_status {
                         ui.separator();
-                        ui.label(
-                            egui::RichText::new(format!("{} of {} rows", vis, tot))
-                                .weak(),
-                        );
+                        ui.label(egui::RichText::new(format!("{} of {} rows", vis, tot)).weak());
                     }
                     ui.separator();
-                    ui.toggle_value(
-                        &mut summary_open,
-                        egui::RichText::new("Summary").size(14.0),
-                    );
+                    ui.toggle_value(&mut summary_open, egui::RichText::new("Summary").size(14.0));
                     let clear_filters = ui.add_enabled(
                         row_status.is_some(),
-                        egui::Button::new(
-                            egui::RichText::new("Clear filters").size(14.0),
-                        ),
+                        egui::Button::new(egui::RichText::new("Clear filters").size(14.0)),
                     );
                     if clear_filters.clicked() {
                         do_clear_filters = true;
@@ -1713,36 +1657,29 @@ impl eframe::App for GalleryApp {
                 // viewers. In a right-to-left layout the first item added sits
                 // furthest right, so "Clear all" ends up as the rightmost
                 // button and "Clear frame" to its left.
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        let clear_all = ui.add_enabled(
-                            n > 0,
-                            egui::Button::new(egui::RichText::new("Clear all").size(14.0)),
-                        );
-                        if clear_all.clicked() {
-                            do_clear_all = true;
-                        }
-                        let clear_frame = ui.add_enabled(
-                            n > 0,
-                            egui::Button::new(
-                                egui::RichText::new("Clear frame").size(14.0),
-                            ),
-                        );
-                        if clear_frame.clicked() {
-                            do_clear_frame = true;
-                        }
-                        let export = ui.add_enabled(
-                            n > 0,
-                            egui::Button::new(
-                                egui::RichText::new("Export...").size(14.0),
-                            ),
-                        );
-                        if export.clicked() {
-                            do_export = true;
-                        }
-                    },
-                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let clear_all = ui.add_enabled(
+                        n > 0,
+                        egui::Button::new(egui::RichText::new("Clear all").size(14.0)),
+                    );
+                    if clear_all.clicked() {
+                        do_clear_all = true;
+                    }
+                    let clear_frame = ui.add_enabled(
+                        n > 0,
+                        egui::Button::new(egui::RichText::new("Clear frame").size(14.0)),
+                    );
+                    if clear_frame.clicked() {
+                        do_clear_frame = true;
+                    }
+                    let export = ui.add_enabled(
+                        n > 0,
+                        egui::Button::new(egui::RichText::new("Export...").size(14.0)),
+                    );
+                    if export.clicked() {
+                        do_export = true;
+                    }
+                });
             });
             ui.add_space(4.0);
         });
@@ -1897,122 +1834,121 @@ fn render_summary(ui: &mut egui::Ui, frame: &RustdfApp) {
     egui::ScrollArea::vertical()
         .id_salt(("summary_scroll", frame.id))
         .show(ui, |ui| {
-    ui.add_space(8.0);
-    ui.heading(&frame.headers[col]);
-    ui.label(egui::RichText::new(format!("type: {}", frame.types[col])).weak());
-    ui.separator();
+            ui.add_space(8.0);
+            ui.heading(&frame.headers[col]);
+            ui.label(egui::RichText::new(format!("type: {}", frame.types[col])).weak());
+            ui.separator();
 
-    // Prefer the cache, which holds stats over the visible rows; fall back to
-    // the load-time full-frame stats if it is somehow absent.
-    let st: &ColStats = match &frame.summary_cache {
-        Some((cc, _, s)) if *cc == col => s,
-        _ => &frame.stats[col],
-    };
-    let denom = frame.view_order.len();
-    let pct = if denom > 0 {
-        st.missing as f64 / denom as f64 * 100.0
-    } else {
-        0.0
-    };
-    egui::Grid::new(("summary_head", frame.id, col))
-        .num_columns(2)
-        .spacing([12.0, 4.0])
-        .show(ui, |ui| {
-            ui.label("missing");
-            ui.label(format!("{} ({:.1}%)", st.missing, pct));
-            ui.end_row();
-            ui.label("unique");
-            ui.label(format!("{}", st.unique));
-            ui.end_row();
-        });
-    ui.separator();
-
-    match &st.detail {
-        StatDetail::Numeric {
-            min,
-            median,
-            mean,
-            max,
-        } => {
-            egui::Grid::new(("summary_num", frame.id, col))
-                .num_columns(2)
-                .spacing([12.0, 4.0])
-                .show(ui, |ui| {
-                    ui.label("min");
-                    ui.label(fmt_num(*min));
-                    ui.end_row();
-                    ui.label("median");
-                    ui.label(fmt_num(*median));
-                    ui.end_row();
-                    ui.label("mean");
-                    ui.label(fmt_num(*mean));
-                    ui.end_row();
-                    ui.label("max");
-                    ui.label(fmt_num(*max));
-                    ui.end_row();
-                });
-        }
-        StatDetail::Logical { n_true, n_false } => {
-            egui::Grid::new(("summary_lgl", frame.id, col))
-                .num_columns(2)
-                .spacing([12.0, 4.0])
-                .show(ui, |ui| {
-                    ui.label("TRUE");
-                    ui.label(format!("{}", n_true));
-                    ui.end_row();
-                    ui.label("FALSE");
-                    ui.label(format!("{}", n_false));
-                    ui.end_row();
-                });
-        }
-        StatDetail::Range { min, max } => {
-            egui::Grid::new(("summary_range", frame.id, col))
-                .num_columns(2)
-                .spacing([12.0, 4.0])
-                .show(ui, |ui| {
-                    ui.label("min");
-                    ui.label(min);
-                    ui.end_row();
-                    ui.label("max");
-                    ui.label(max);
-                    ui.end_row();
-                });
-        }
-        StatDetail::Categorical { top, other } => {
-            let truncated = *other > 0;
-            let label = if truncated {
-                "most frequent"
-            } else if frame.types[col] == "fct" {
-                "levels"
-            } else {
-                "values"
+            // Prefer the cache, which holds stats over the visible rows; fall back to
+            // the load-time full-frame stats if it is somehow absent.
+            let st: &ColStats = match &frame.summary_cache {
+                Some((cc, _, s)) if *cc == col => s,
+                _ => &frame.stats[col],
             };
-            ui.label(egui::RichText::new(label).weak());
-            ui.add_space(2.0);
-            egui::Grid::new(("summary_cat", frame.id, col))
+            let denom = frame.view_order.len();
+            let pct = if denom > 0 {
+                st.missing as f64 / denom as f64 * 100.0
+            } else {
+                0.0
+            };
+            egui::Grid::new(("summary_head", frame.id, col))
                 .num_columns(2)
                 .spacing([12.0, 4.0])
                 .show(ui, |ui| {
-                    for (val, cnt) in top {
-                        ui.label(val);
-                        ui.label(format!("{}", cnt));
-                        ui.end_row();
-                    }
-                    if truncated {
-                        let rem = st.unique.saturating_sub(top.len());
-                        ui.label(
-                            egui::RichText::new(format!("other ({} levels)", rem))
-                                .weak(),
-                        );
-                        ui.label(egui::RichText::new(format!("{}", other)).weak());
-                        ui.end_row();
-                    }
+                    ui.label("missing");
+                    ui.label(format!("{} ({:.1}%)", st.missing, pct));
+                    ui.end_row();
+                    ui.label("unique");
+                    ui.label(format!("{}", st.unique));
+                    ui.end_row();
                 });
-        }
-        StatDetail::Empty => {
-            ui.label("(no non-missing values)");
-        }
-    }
+            ui.separator();
+
+            match &st.detail {
+                StatDetail::Numeric {
+                    min,
+                    median,
+                    mean,
+                    max,
+                } => {
+                    egui::Grid::new(("summary_num", frame.id, col))
+                        .num_columns(2)
+                        .spacing([12.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label("min");
+                            ui.label(fmt_num(*min));
+                            ui.end_row();
+                            ui.label("median");
+                            ui.label(fmt_num(*median));
+                            ui.end_row();
+                            ui.label("mean");
+                            ui.label(fmt_num(*mean));
+                            ui.end_row();
+                            ui.label("max");
+                            ui.label(fmt_num(*max));
+                            ui.end_row();
+                        });
+                }
+                StatDetail::Logical { n_true, n_false } => {
+                    egui::Grid::new(("summary_lgl", frame.id, col))
+                        .num_columns(2)
+                        .spacing([12.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label("TRUE");
+                            ui.label(format!("{}", n_true));
+                            ui.end_row();
+                            ui.label("FALSE");
+                            ui.label(format!("{}", n_false));
+                            ui.end_row();
+                        });
+                }
+                StatDetail::Range { min, max } => {
+                    egui::Grid::new(("summary_range", frame.id, col))
+                        .num_columns(2)
+                        .spacing([12.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label("min");
+                            ui.label(min);
+                            ui.end_row();
+                            ui.label("max");
+                            ui.label(max);
+                            ui.end_row();
+                        });
+                }
+                StatDetail::Categorical { top, other } => {
+                    let truncated = *other > 0;
+                    let label = if truncated {
+                        "most frequent"
+                    } else if frame.types[col] == "fct" {
+                        "levels"
+                    } else {
+                        "values"
+                    };
+                    ui.label(egui::RichText::new(label).weak());
+                    ui.add_space(2.0);
+                    egui::Grid::new(("summary_cat", frame.id, col))
+                        .num_columns(2)
+                        .spacing([12.0, 4.0])
+                        .show(ui, |ui| {
+                            for (val, cnt) in top {
+                                ui.label(val);
+                                ui.label(format!("{}", cnt));
+                                ui.end_row();
+                            }
+                            if truncated {
+                                let rem = st.unique.saturating_sub(top.len());
+                                ui.label(
+                                    egui::RichText::new(format!("other ({} levels)", rem)).weak(),
+                                );
+                                ui.label(egui::RichText::new(format!("{}", other)).weak());
+                                ui.end_row();
+                            }
+                        });
+                }
+                StatDetail::Empty => {
+                    ui.label("(no non-missing values)");
+                }
+            }
         });
 }
 
@@ -2052,7 +1988,9 @@ fn export_frame(arrow_path: &Path, default_name: &str, indices: &[usize], full: 
         write_csv(arrow_path, &dest, if full { None } else { Some(indices) })
     } else if full {
         // Whole frame in original order: a plain lossless file copy.
-        fs::copy(arrow_path, &dest).map(|_| ()).map_err(|e| e.into())
+        fs::copy(arrow_path, &dest)
+            .map(|_| ())
+            .map_err(|e| e.into())
     } else {
         write_arrow_filtered(arrow_path, &dest, indices)
     };
@@ -2074,8 +2012,7 @@ fn read_combined(
     let input = File::open(arrow_path)?;
     let reader = FileReader::try_new(input, None)?;
     let schema = reader.schema();
-    let batches: Vec<arrow::record_batch::RecordBatch> =
-        reader.collect::<Result<Vec<_>, _>>()?;
+    let batches: Vec<arrow::record_batch::RecordBatch> = reader.collect::<Result<Vec<_>, _>>()?;
     let combined = arrow::compute::concat_batches(&schema, &batches)?;
     Ok((schema, combined))
 }
@@ -2086,9 +2023,8 @@ fn take_rows(
     batch: &arrow::record_batch::RecordBatch,
     indices: &[usize],
 ) -> Result<arrow::record_batch::RecordBatch, Box<dyn std::error::Error>> {
-    let idx = arrow::array::UInt32Array::from(
-        indices.iter().map(|&i| i as u32).collect::<Vec<u32>>(),
-    );
+    let idx =
+        arrow::array::UInt32Array::from(indices.iter().map(|&i| i as u32).collect::<Vec<u32>>());
     let mut cols = Vec::with_capacity(batch.num_columns());
     for c in 0..batch.num_columns() {
         cols.push(arrow::compute::take(batch.column(c).as_ref(), &idx, None)?);

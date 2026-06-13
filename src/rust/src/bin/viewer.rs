@@ -23,6 +23,7 @@
 //! The UI follows the OS appearance setting (Light / Dark on macOS),
 //! including runtime changes. The plot itself keeps R's native
 //! background — typically white — regardless of UI theme.
+#![windows_subsystem = "windows"]
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -96,7 +97,9 @@ fn main() {
 fn setup_egui_fonts(ctx: &egui::Context, fonts_dir: Option<&Path>) {
     let Some(dir) = fonts_dir else { return };
     let font_path = dir.join("LiberationSans-Regular.ttf");
-    let Ok(bytes) = std::fs::read(&font_path) else { return };
+    let Ok(bytes) = std::fs::read(&font_path) else {
+        return;
+    };
 
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
@@ -386,8 +389,7 @@ impl ViewerApp {
                 if logical_window.0 > 0 && logical_window.1 > 0 {
                     if ui.button("Use window size").clicked() {
                         if self.export_dpi > 0 {
-                            self.export_width_in =
-                                logical_window.0 as f32 / self.export_dpi as f32;
+                            self.export_width_in = logical_window.0 as f32 / self.export_dpi as f32;
                             self.export_height_in =
                                 logical_window.1 as f32 / self.export_dpi as f32;
                         }
@@ -406,8 +408,7 @@ impl ViewerApp {
 
                 ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new(format!("Output: {} × {} px", preview.0, preview.1))
-                        .weak(),
+                    egui::RichText::new(format!("Output: {} × {} px", preview.0, preview.1)).weak(),
                 );
 
                 ui.separator();
@@ -624,12 +625,7 @@ impl ViewerApp {
                 .pixels()
                 .iter()
                 .map(|p| {
-                    egui::Color32::from_rgba_premultiplied(
-                        p.red(),
-                        p.green(),
-                        p.blue(),
-                        p.alpha(),
-                    )
+                    egui::Color32::from_rgba_premultiplied(p.red(), p.green(), p.blue(), p.alpha())
                 })
                 .collect();
 
@@ -761,11 +757,7 @@ impl eframe::App for ViewerApp {
                 let counter_text = if self.svg_paths.is_empty() {
                     "no plots".to_string()
                 } else {
-                    format!(
-                        "Plot {} / {}",
-                        self.current_index + 1,
-                        self.svg_paths.len()
-                    )
+                    format!("Plot {} / {}", self.current_index + 1, self.svg_paths.len())
                 };
                 ui.label(counter_text);
                 ui.separator();
@@ -867,8 +859,7 @@ impl eframe::App for ViewerApp {
             };
 
             if needs_render {
-                if let Some((image, rendered)) =
-                    self.render_svg(&current_path, target_w, target_h)
+                if let Some((image, rendered)) = self.render_svg(&current_path, target_w, target_h)
                 {
                     // Update the existing texture in place if we have
                     // one, otherwise allocate it once. Either way only
