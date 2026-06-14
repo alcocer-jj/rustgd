@@ -176,6 +176,22 @@ struct RustdfApp {
     // the active filter without recomputing every frame.
     view_gen: u64,
     summary_cache: Option<(usize, u64, ColStats)>,
+    // Keyboard navigation state. `pending_scroll`, when set, is a forced vertical
+    // scroll offset applied and cleared on the next render so an arrow-selected
+    // cell that fell outside the visible band is brought into view.
+    // `last_body_height` is the data body's viewport height in pixels from the
+    // previous render, which together with the scroll offset lets the arrow
+    // handler decide whether and how far to scroll, accurate to the pixel rather
+    // than rounded to whole (and partly clipped) rows.
+    pending_scroll: Option<f32>,
+    last_body_height: f32,
+    // Horizontal counterparts, for left/right navigation across columns:
+    // `pending_h_scroll` is a forced horizontal offset applied on the next
+    // render, `h_offset` and `last_body_width` are the data body's horizontal
+    // scroll offset and viewport width from the previous render.
+    pending_h_scroll: Option<f32>,
+    h_offset: f32,
+    last_body_width: f32,
 }
 
 impl RustdfApp {
@@ -372,6 +388,11 @@ impl RustdfApp {
             view_order,
             view_gen: 0,
             summary_cache: None,
+            pending_scroll: None,
+            last_body_height: 0.0,
+            pending_h_scroll: None,
+            h_offset: 0.0,
+            last_body_width: 0.0,
         })
     }
 
@@ -771,10 +792,155 @@ fn wait_for_any_frame(dir: &Path, timeout: Duration) -> bool {
 }
 
 impl RustdfApp {
+    /// Handle keyboard navigation and copy for this (the active) frame. Arrow
+    /// keys move a single-cell selection through the current view order, the same
+    /// order the table draws, so navigation respects the active sort and filters;
+    /// they clamp at the edges rather than wrapping. If nothing is selected, or a
+    /// row or column is selected, or the selected cell has been filtered out of
+    /// view, the first arrow press selects the top-left visible cell. Command or
+    /// Ctrl+C copies the selected cell's text, or the whole selected row as
+    /// tab-separated text. Keys are ignored while a text field (a filter input)
+    /// holds keyboard focus, so typing in and copying from a filter still behave
+    /// normally; arrow keys are consumed so they do not also scroll the table.
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        // Defer to whatever widget wants the keyboard (the contains and min/max
+        // filter inputs), so editing and in-field copy are untouched.
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+
+        // Copy: a selected cell, or a whole selected row joined by tabs. Columns
+        // keep their existing copy in the column three-dot menu. egui delivers
+        // the copy shortcut as an Event::Copy, not a Key::C press, which is what
+        // its own text widgets watch for, so detect that rather than the key.
+        let want_copy = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
+        if want_copy {
+            let text = match self.selection {
+                Selection::Cell(orig, c) => {
+                    self.rows.get(orig).and_then(|row| row.get(c)).cloned()
+                }
+                Selection::Row(orig) => self.rows.get(orig).map(|row| row.join("\t")),
+                _ => None,
+            };
+            if let Some(text) = text {
+                ctx.copy_text(text);
+            }
+        }
+
+        // Arrow navigation. Consume the keys so the scroll areas do not also act.
+        let up = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp));
+        let down = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown));
+        let left = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft));
+        let right = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight));
+        if !(up || down || left || right) {
+            return;
+        }
+
+        let visible = self.view_order.len();
+        let ncols = self.headers.len();
+        if visible == 0 || ncols == 0 {
+            return;
+        }
+
+        // The current selection as a (view position, column) pair. A non-cell
+        // selection, or a cell hidden by the active filter, has no live position,
+        // so the first arrow lands at the top-left visible cell.
+        let current = match self.selection {
+            Selection::Cell(orig, c) => self
+                .view_order
+                .iter()
+                .position(|&o| o == orig)
+                .map(|vpos| (vpos, c.min(ncols - 1))),
+            _ => None,
+        };
+
+        let (mut vpos, mut col) = match current {
+            Some(pair) => pair,
+            None => {
+                let orig = self.view_order[0];
+                self.selection = Selection::Cell(orig, 0);
+                self.scroll_to_view_row(0);
+                self.scroll_to_view_col(0);
+                return;
+            }
+        };
+
+        if up {
+            vpos = vpos.saturating_sub(1);
+        }
+        if down {
+            vpos = (vpos + 1).min(visible - 1);
+        }
+        if left {
+            col = col.saturating_sub(1);
+        }
+        if right {
+            col = (col + 1).min(ncols - 1);
+        }
+
+        let orig = self.view_order[vpos];
+        self.selection = Selection::Cell(orig, col);
+        self.scroll_to_view_row(vpos);
+        self.scroll_to_view_col(col);
+    }
+
+    /// Request that the given view position be visible on the next render, using
+    /// the data body's viewport height and scroll offset from the last render.
+    /// The math is in pixels: scroll up only enough to put the row's top at the
+    /// viewport top, or down only enough to put its bottom at the viewport bottom,
+    /// and nothing at all when the row is already fully visible. Working in pixels
+    /// rather than whole rows avoids the partly clipped bottom row that made the
+    /// selection slide out of view.
+    fn scroll_to_view_row(&mut self, vpos: usize) {
+        let body_h = self.last_body_height;
+        let row_top = vpos as f32 * ROW_H;
+        if body_h <= 0.0 {
+            self.pending_scroll = Some(row_top.max(0.0));
+            return;
+        }
+        let view_top = self.v_offset;
+        let view_bot = view_top + body_h;
+        let row_bot = row_top + ROW_H;
+        if row_top < view_top {
+            self.pending_scroll = Some(row_top.max(0.0));
+        } else if row_bot > view_bot {
+            self.pending_scroll = Some((row_bot - body_h).max(0.0));
+        }
+    }
+
+    /// Horizontal counterpart of `scroll_to_view_row`. The selected column's left
+    /// and right edges come from summing the column widths up to it; the data
+    /// body's viewport width and horizontal offset from the last render decide
+    /// whether and how far to scroll sideways. The frozen index column lives
+    /// outside this scroll area, so it stays put. Nothing is requested when the
+    /// column is already fully visible.
+    fn scroll_to_view_col(&mut self, col: usize) {
+        let body_w = self.last_body_width;
+        let col_left: f32 = self.col_widths.iter().take(col).sum();
+        let col_w = self.col_widths.get(col).copied().unwrap_or(0.0);
+        let col_right = col_left + col_w;
+        if body_w <= 0.0 {
+            self.pending_h_scroll = Some(col_left.max(0.0));
+            return;
+        }
+        let view_left = self.h_offset;
+        let view_right = view_left + body_w;
+        if col_left < view_left {
+            self.pending_h_scroll = Some(col_left.max(0.0));
+        } else if col_right > view_right {
+            self.pending_h_scroll = Some((col_right - body_w).max(0.0));
+        }
+    }
+
     /// Draw this frame's table into the given ui. The gallery owns the window,
     /// the toolbar, and the close marker; this renders one frame's content and
     /// keeps its own sort, selection, resize, and scroll state.
     fn render(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        // Keyboard navigation and copy run first, before the fields are read into
+        // the locals below, so a key-driven selection or scroll change takes
+        // effect in this same frame's draw.
+        self.handle_keys(ctx);
+
         // Palette derived from egui's current visuals, so the window follows
         // the system theme and matches the plot viewer and web viewer in both
         // light and dark, rather than rustdf's fixed dark colors. Header and
@@ -818,6 +984,15 @@ impl RustdfApp {
         let preview = full_rows > nrows;
         let ncols = headers.len();
         let mirror = self.v_offset;
+        // A pending keyboard scroll (taken so it applies once), and the data
+        // body's viewport height captured during this render for next time.
+        let forced_scroll = self.pending_scroll.take();
+        let mut seen_body_h: f32 = 0.0;
+        let forced_h = self.pending_h_scroll.take();
+        // Assigned unconditionally from the horizontal scroll output below, so no
+        // initializer is needed (and a dead one would warn).
+        let seen_h_off: f32;
+        let seen_body_w: f32;
         let mut deltas = vec![0.0_f32; ncols];
         let mut clicked_col: Option<usize> = None;
         let mut clicked_index: Option<usize> = None;
@@ -877,7 +1052,7 @@ impl RustdfApp {
                     .id_salt(("idx_v", id))
                     .auto_shrink([true, false])
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                    .vertical_scroll_offset(mirror)
+                    .vertical_scroll_offset(forced_scroll.unwrap_or(mirror))
                     .show_rows(ui, ROW_H, visible, |ui, row_range| {
                         ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
                         let mut idx_sel_rects: Vec<egui::Rect> = Vec::new();
@@ -937,10 +1112,13 @@ impl RustdfApp {
             data_ui.set_clip_rect(data_rect);
             let new_offset = {
                 let ui = &mut data_ui;
-                egui::ScrollArea::horizontal()
+                let mut data_h_area = egui::ScrollArea::horizontal()
                     .id_salt(("data_h", id))
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
+                    .auto_shrink([false, false]);
+                if let Some(off) = forced_h {
+                    data_h_area = data_h_area.horizontal_scroll_offset(off);
+                }
+                let h_out = data_h_area.show(ui, |ui| {
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
 
@@ -1301,13 +1479,16 @@ impl RustdfApp {
                             });
 
                             // data body
-                            let out = egui::ScrollArea::vertical()
+                            let mut data_v_area = egui::ScrollArea::vertical()
                                 .id_salt(("data_v", id))
                                 .auto_shrink([true, false])
                                 .scroll_bar_visibility(
                                     egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
-                                )
-                                .show_rows(ui, ROW_H, visible, |ui, row_range| {
+                                );
+                            if let Some(off) = forced_scroll {
+                                data_v_area = data_v_area.vertical_scroll_offset(off);
+                            }
+                            let out = data_v_area.show_rows(ui, ROW_H, visible, |ui, row_range| {
                                     ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
                                     let mut data_sel_rects: Vec<egui::Rect> = Vec::new();
                                     for r in row_range {
@@ -1364,11 +1545,14 @@ impl RustdfApp {
                                         ui.painter().rect_stroke(*r, 0.0, sel_stroke);
                                     }
                                 });
+                            seen_body_h = out.inner_rect.height();
                             out.state.offset.y
                         })
                         .inner
-                    })
-                    .inner
+                    });
+                seen_h_off = h_out.state.offset.x;
+                seen_body_w = h_out.inner_rect.width();
+                h_out.inner
             };
             ui.painter()
                 .hline(full.left()..=full.right(), full.top() + 0.5, grid_stroke);
@@ -1445,6 +1629,9 @@ impl RustdfApp {
             ctx.request_repaint();
         }
         self.v_offset = new_offset;
+        self.last_body_height = seen_body_h;
+        self.h_offset = seen_h_off;
+        self.last_body_width = seen_body_w;
     }
 }
 

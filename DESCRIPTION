@@ -1,6 +1,6 @@
 Package: rustgd
 Title: Rust-Backed Graphics Device and Viewer Windows for Terminal R Sessions
-Version: 0.0.0.9000
+Version: 0.0.0.9001
 Authors@R: 
     person("Jose J.", "Alcocer", email = "alcocer@protonmail.com", role = c("aut", "cre"))
 Description: Provides a Rust-backed graphics device and companion viewer
