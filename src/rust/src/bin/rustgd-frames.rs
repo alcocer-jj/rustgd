@@ -24,8 +24,10 @@
 //! tell a live window from a force-killed one and relaunch a fresh window
 //! rather than reopening onto the previous session's frames.
 //! Export saves the rows currently shown (filtered and in view order): the
-//! save dialog's extension picks Arrow or CSV, and an unfiltered, unsorted
-//! frame is exported as a lossless Arrow file copy. The Summary toggle opens
+//! save dialog's extension picks the format. Arrow is lossless and keeps every
+//! column (an unfiltered, unsorted frame is a plain file copy); CSV and xlsx are
+//! flat, so list columns are written blank, and a "?" popover by the Export
+//! button explains the tradeoffs. The Summary toggle opens
 //! a side panel showing the selected column's stats (missing, unique, and a
 //! type-appropriate summary), recomputed over the visible rows so it tracks
 //! the filter. Each column's three-dot menu carries a filter: a level
@@ -37,16 +39,18 @@
 //! Run:    rustgd-frames /tmp/rustgd-frames-<pid>
 #![windows_subsystem = "windows"]
 
-use arrow::array::Array;
+use arrow::array::{Array, ArrayRef, StringArray};
 use arrow::csv::WriterBuilder;
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::ipc::reader::FileReader;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use eframe::egui;
+use rust_xlsxwriter::Workbook;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -123,7 +127,23 @@ enum StatDetail {
         min: String,
         max: String,
     },
+    Text {
+        empty: usize,
+        chars: Dist,
+        words: Dist,
+        top: Vec<(String, usize)>,
+    },
+    List,
     Empty,
+}
+
+/// A min/median/mean/max summary of a set of counts (character or word lengths),
+/// kept as f64 so an even-count median can carry a half and the mean is exact.
+struct Dist {
+    min: f64,
+    median: f64,
+    mean: f64,
+    max: f64,
 }
 
 /// Short R-style type label for a column. Works on the Arrow schema directly.
@@ -132,20 +152,289 @@ fn type_label(dt: &DataType) -> String {
         DataType::Int8
         | DataType::Int16
         | DataType::Int32
-        | DataType::Int64
         | DataType::UInt8
         | DataType::UInt16
         | DataType::UInt32
         | DataType::UInt64 => "int",
+        DataType::Int64 => "integer64",
         DataType::Float16 | DataType::Float32 | DataType::Float64 => "dbl",
-        DataType::Utf8 | DataType::LargeUtf8 => "chr",
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "decimal",
+        DataType::Utf8 | DataType::LargeUtf8 => "str",
         DataType::Boolean => "lgl",
-        DataType::Date32 | DataType::Date64 => "date",
-        DataType::Timestamp(_, _) => "datetime",
+        DataType::Date32 | DataType::Date64 => "Date",
+        DataType::Timestamp(_, _) => "POSIXct",
+        DataType::Time32(_) | DataType::Time64(_) => "hms",
+        DataType::Duration(_) => "difftime",
+        DataType::Interval(_) => "interval",
         DataType::Dictionary(_, _) => "fct",
+        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => "blob",
+        DataType::Struct(_) => "struct",
+        DataType::Map(_, _) => "map",
+        DataType::Union(_, _) => "union",
+        DataType::Null => "null",
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => "list",
+        // Reserved for Arrow types R does not produce (view-encoded, run-end).
         _ => "?",
     }
     .to_string()
+}
+
+/// Opaque columns: those the flat exporters cannot represent and the viewer
+/// cannot meaningfully sort, filter, or summarise. Lists, binary (blob), struct,
+/// map, and union. These are blanked in CSV and xlsx, shown as placeholders, and
+/// get only a missing count in the summary.
+fn is_opaque(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::FixedSizeBinary(_)
+            | DataType::Struct(_)
+            | DataType::Map(_, _)
+            | DataType::Union(_, _)
+    )
+}
+
+/// Whether an Arrow data type is one of the list families the viewer shows as a
+/// placeholder rather than dumping its contents.
+fn is_arrow_list(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _)
+    )
+}
+
+/// The element type label of a list column (for example "int" for a List<int>),
+/// used in the per-row "<int [n]>" placeholder. None for non-list types.
+fn list_child_label(dt: &DataType) -> Option<String> {
+    match dt {
+        DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => {
+            Some(type_label(f.data_type()))
+        }
+        _ => None,
+    }
+}
+
+/// The number of elements in list cell `r`, or None when that cell is null (an
+/// R NA list element). Reads the offset buffer for List/LargeList and the fixed
+/// width for FixedSizeList; any other array type yields Some(0) defensively, but
+/// this is only ever called on columns already known to be Arrow lists.
+fn list_cell_len(arr: &dyn Array, r: usize) -> Option<usize> {
+    use arrow::array::{FixedSizeListArray, LargeListArray, ListArray};
+    if arr.is_null(r) {
+        return None;
+    }
+    if let Some(la) = arr.as_any().downcast_ref::<ListArray>() {
+        let off = la.value_offsets();
+        Some((off[r + 1] - off[r]) as usize)
+    } else if let Some(la) = arr.as_any().downcast_ref::<LargeListArray>() {
+        let off = la.value_offsets();
+        Some((off[r + 1] - off[r]) as usize)
+    } else if let Some(la) = arr.as_any().downcast_ref::<FixedSizeListArray>() {
+        Some(la.value_length() as usize)
+    } else {
+        Some(0)
+    }
+}
+
+/// The byte length of binary cell `r`, or None when that cell is null. Used for
+/// the Positron-style "<blob [n B]>" placeholder.
+fn blob_cell_len(arr: &dyn Array, r: usize) -> Option<usize> {
+    use arrow::array::{BinaryArray, FixedSizeBinaryArray, LargeBinaryArray};
+    if arr.is_null(r) {
+        return None;
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<BinaryArray>() {
+        Some(a.value(r).len())
+    } else if let Some(a) = arr.as_any().downcast_ref::<LargeBinaryArray>() {
+        Some(a.value(r).len())
+    } else if let Some(a) = arr.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+        Some(a.value(r).len())
+    } else {
+        Some(0)
+    }
+}
+
+/// The number of distinct levels in a dictionary (factor) array, across any key
+/// width, for the "fct(n)" label. None if the array is not a dictionary.
+fn dict_value_count(arr: &dyn Array) -> Option<usize> {
+    use arrow::array::DictionaryArray;
+    use arrow::datatypes::{
+        Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt8Type,
+    };
+    macro_rules! try_key {
+        ($t:ty) => {
+            if let Some(d) = arr.as_any().downcast_ref::<DictionaryArray<$t>>() {
+                return Some(d.values().len());
+            }
+        };
+    }
+    try_key!(Int8Type);
+    try_key!(Int16Type);
+    try_key!(Int32Type);
+    try_key!(Int64Type);
+    try_key!(UInt8Type);
+    try_key!(UInt16Type);
+    try_key!(UInt32Type);
+    None
+}
+
+/// The raw stored integer of a duration cell, across any arrow time unit, or
+/// None when the cell is null. The value is in the array's own time unit; the
+/// caller scales it to R's units.
+fn duration_raw(arr: &dyn Array, r: usize) -> Option<i64> {
+    use arrow::array::{
+        DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
+        DurationSecondArray,
+    };
+    if arr.is_null(r) {
+        return None;
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<DurationSecondArray>() {
+        Some(a.value(r))
+    } else if let Some(a) = arr.as_any().downcast_ref::<DurationMillisecondArray>() {
+        Some(a.value(r))
+    } else if let Some(a) = arr.as_any().downcast_ref::<DurationMicrosecondArray>() {
+        Some(a.value(r))
+    } else if let Some(a) = arr.as_any().downcast_ref::<DurationNanosecondArray>() {
+        Some(a.value(r))
+    } else {
+        None
+    }
+}
+
+/// Seconds in one tick of an arrow duration time unit.
+fn arrow_duration_unit_secs(tu: &TimeUnit) -> f64 {
+    match tu {
+        TimeUnit::Second => 1.0,
+        TimeUnit::Millisecond => 1e-3,
+        TimeUnit::Microsecond => 1e-6,
+        TimeUnit::Nanosecond => 1e-9,
+    }
+}
+
+/// Seconds in one R difftime unit, for converting arrow's stored duration back
+/// into the units the R column carried, so a value read off the viewer matches
+/// what `v == n` compares against in R. Unknown units fall back to seconds.
+fn r_difftime_unit_secs(unit: &str) -> f64 {
+    match unit {
+        "secs" => 1.0,
+        "mins" => 60.0,
+        "hours" => 3600.0,
+        "days" => 86400.0,
+        "weeks" => 604800.0,
+        _ => 1.0,
+    }
+}
+
+/// How a column's cells are rendered, decided once at load.
+enum CellRender {
+    /// Format with arrow's ArrayFormatter (scalars, strings, dates, and the
+    /// R-stringified object-list placeholder columns, which are plain text).
+    Formatter,
+    /// Real Arrow list: "<childtype [n]>" with the child type label.
+    ListPlaceholder(String),
+    /// Binary/blob: "<blob [n B]>".
+    BlobPlaceholder,
+    /// Struct/map/union: a fixed "<struct>" style tag, never the nested content.
+    Tag(&'static str),
+    /// difftime: arrow drops R's units attribute and stores a duration in a
+    /// fixed unit, so we render the bare numeric value back in R's original
+    /// units (carried in the descriptor). `value = raw * arrow_unit_secs /
+    /// r_unit_secs`, computed in that order so whole results stay exact. The
+    /// unit itself is shown in the column header, not the cell, so a copied cell
+    /// is just the number `== n` expects.
+    Duration { arrow_unit_secs: f64, r_unit_secs: f64 },
+}
+
+/// Min/median/mean/max of a set of counts. Sorts in place. Returns all zeros for
+/// an empty input (the caller suppresses the display in that case).
+fn dist_of(v: &mut [usize]) -> Dist {
+    if v.is_empty() {
+        return Dist {
+            min: 0.0,
+            median: 0.0,
+            mean: 0.0,
+            max: 0.0,
+        };
+    }
+    v.sort_unstable();
+    let n = v.len();
+    let sum: usize = v.iter().sum();
+    let median = if n % 2 == 1 {
+        v[n / 2] as f64
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) as f64 / 2.0
+    };
+    Dist {
+        min: v[0] as f64,
+        median,
+        mean: sum as f64 / n as f64,
+        max: v[n - 1] as f64,
+    }
+}
+
+/// How many top terms the chr summary keeps.
+const TEXT_TOP_TERMS: usize = 15;
+
+/// Text-column summary over a set of cells (the "NA" sentinel is treated as
+/// missing and skipped). Returns the distinct non-missing count, the empty-string
+/// count, the non-missing count, the character- and word-length distributions,
+/// and the most frequent terms. Terms are whitespace-split, stripped of leading
+/// and trailing ASCII punctuation, and lowercased; no stopword filtering, by
+/// design (preprocess the column if you want cleaner terms).
+fn text_stats<'a>(
+    cells: impl Iterator<Item = &'a str>,
+) -> (usize, usize, usize, Dist, Dist, Vec<(String, usize)>) {
+    let mut unique: HashSet<&str> = HashSet::new();
+    let mut empty = 0usize;
+    let mut nonmissing = 0usize;
+    let mut char_lens: Vec<usize> = Vec::new();
+    let mut word_lens: Vec<usize> = Vec::new();
+    let mut tokens: HashMap<String, usize> = HashMap::new();
+    for cell in cells {
+        if cell == "NA" {
+            continue;
+        }
+        nonmissing += 1;
+        unique.insert(cell);
+        if cell.is_empty() {
+            empty += 1;
+        }
+        char_lens.push(cell.chars().count());
+        word_lens.push(cell.split_whitespace().count());
+        for raw in cell.split_whitespace() {
+            let tok = raw
+                .trim_matches(|ch: char| ch.is_ascii_punctuation())
+                .to_lowercase();
+            if !tok.is_empty() {
+                *tokens.entry(tok).or_insert(0) += 1;
+            }
+        }
+    }
+    let unique_n = unique.len();
+    let cdist = dist_of(&mut char_lens);
+    let wdist = dist_of(&mut word_lens);
+    let mut pairs: Vec<(String, usize)> = tokens.into_iter().collect();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    pairs.truncate(TEXT_TOP_TERMS);
+    (unique_n, empty, nonmissing, cdist, wdist, pairs)
+}
+
+/// Clip a display label to at most `max` characters, appending an ellipsis when
+/// it is shortened, so a long factor level or other value cannot stretch the
+/// summary panel off screen.
+fn clip_label(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
 }
 
 struct RustdfApp {
@@ -154,6 +443,17 @@ struct RustdfApp {
     types: Vec<String>,
     rows: Vec<Vec<String>>,
     numeric: Vec<bool>,
+    // True for opaque columns: real Arrow lists, binary (blob), struct, map, and
+    // union, plus the object-list columns the R side stringified (flagged in the
+    // descriptor). Sort, filter, and the expand popup are disabled on these, they
+    // are blanked on flat export, and their summary shows only the missing count.
+    list_col: Vec<bool>,
+    // Declared factor level count per column, for the "fct(n)" header label.
+    // None for non-factor columns.
+    fct_levels: Vec<Option<usize>>,
+    // R units per difftime column, for the "difftime (mins)" header label. None
+    // for non-difftime columns (and difftime columns with no units descriptor).
+    difftime_units: Vec<Option<String>>,
     col_widths: Vec<f32>,
     row_order: Vec<usize>,
     sort_col: Option<usize>,
@@ -192,30 +492,119 @@ struct RustdfApp {
     pending_h_scroll: Option<f32>,
     h_offset: f32,
     last_body_width: f32,
+    // The cell whose full content is shown in the floating expand popup, as an
+    // (original row, column) pair, plus the screen position to anchor the popup
+    // at (the double-clicked cell's lower-left). None when no popup is open.
+    // Only chr columns can open it, on a double-click.
+    expanded: Option<(usize, usize)>,
+    expanded_pos: Option<egui::Pos2>,
 }
 
 impl RustdfApp {
-    /// Read an Arrow IPC file fully into display strings (non-paged).
+    /// Read an Arrow IPC file fully into display strings (non-paged). `marked`
+    /// holds the column indices the R side stringified into list placeholders;
+    /// real Arrow List columns are detected here from the schema instead.
     fn from_arrow_ipc(
         path: &Path,
         id: u32,
         full_rows_hint: usize,
+        marked: &HashSet<usize>,
+        difftime_units: &HashMap<usize, String>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let file = File::open(path)?;
         let reader = FileReader::try_new(file, None)?;
         let schema = reader.schema();
 
         let headers: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-        let types: Vec<String> = schema
+        let mut types: Vec<String> = schema
             .fields()
             .iter()
             .map(|f| type_label(f.data_type()))
             .collect();
         let ncols = headers.len();
-        let numeric: Vec<bool> = types
+
+        // Opaque columns (lists, blob, struct, map, union) get a placeholder
+        // display and are blanked on flat export. The R-stringified object-list
+        // columns arrive as plain text but are flagged in `marked`; they are
+        // treated as opaque too and relabeled "list" to match how the real list
+        // columns and Positron present them. Every other opaque column keeps its
+        // own label (blob, struct, and so on).
+        let render: Vec<CellRender> = schema
+            .fields()
             .iter()
-            .map(|t| t.as_str() == "int" || t.as_str() == "dbl")
+            .enumerate()
+            .map(|(c, f)| {
+                let dt = f.data_type();
+                if let DataType::Duration(tu) = dt {
+                    // difftime: only render as a bare number when R told us the
+                    // units; otherwise fall back to arrow's ISO 8601 form.
+                    if let Some(unit) = difftime_units.get(&c) {
+                        return CellRender::Duration {
+                            arrow_unit_secs: arrow_duration_unit_secs(tu),
+                            r_unit_secs: r_difftime_unit_secs(unit),
+                        };
+                    }
+                    return CellRender::Formatter;
+                }
+                if is_arrow_list(dt) {
+                    CellRender::ListPlaceholder(list_child_label(dt).unwrap_or_else(|| "?".into()))
+                } else if matches!(
+                    dt,
+                    DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_)
+                ) {
+                    CellRender::BlobPlaceholder
+                } else if matches!(dt, DataType::Struct(_)) {
+                    CellRender::Tag("struct")
+                } else if matches!(dt, DataType::Map(_, _)) {
+                    CellRender::Tag("map")
+                } else if matches!(dt, DataType::Union(_, _)) {
+                    CellRender::Tag("union")
+                } else {
+                    CellRender::Formatter
+                }
+            })
             .collect();
+        // R units per difftime column we render as numbers, for the header label
+        // ("difftime (mins)"). None for every other column.
+        let difftime_label: Vec<Option<String>> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(c, f)| {
+                if matches!(f.data_type(), DataType::Duration(_)) {
+                    difftime_units.get(&c).cloned()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut list_col = vec![false; ncols];
+        for c in 0..ncols {
+            if is_opaque(schema.field(c).data_type()) {
+                list_col[c] = true;
+            } else if marked.contains(&c) {
+                list_col[c] = true;
+                types[c] = "list".to_string();
+            }
+        }
+
+        let mut numeric: Vec<bool> = types
+            .iter()
+            .map(|t| matches!(t.as_str(), "int" | "integer64" | "dbl" | "decimal"))
+            .collect();
+        // difftime rendered as a bare number behaves numerically: right aligned,
+        // numeric sort and filter, and a min/median/mean/max summary, all over
+        // the value in R's units.
+        for c in 0..ncols {
+            if difftime_label[c].is_some() {
+                numeric[c] = true;
+            }
+        }
+
+        // Declared factor level counts, for the "fct(n)" label, captured from the
+        // first batch's dictionary arrays.
+        let mut fct_levels: Vec<Option<usize>> = vec![None; ncols];
+        let mut first_batch = true;
 
         let options = FormatOptions::default().with_null("NA");
         let mut rows: Vec<Vec<String>> = Vec::new();
@@ -223,30 +612,115 @@ impl RustdfApp {
         // Per-column stat accumulators, filled in the same pass that formats
         // cells. Numeric columns collect parsed values (for min/median/mean/max)
         // and a set of distinct strings; others count value frequencies, which
-        // gives both the unique count and the most-frequent values.
+        // gives both the unique count and the most-frequent values. List columns
+        // accumulate nothing beyond the missing count.
         let mut missing = vec![0usize; ncols];
         let mut num_values: Vec<Vec<f64>> = (0..ncols).map(|_| Vec::new()).collect();
         let mut num_unique: Vec<HashSet<String>> = (0..ncols).map(|_| HashSet::new()).collect();
         let mut cat_counts: Vec<HashMap<String, usize>> =
             (0..ncols).map(|_| HashMap::new()).collect();
+        // Columns whose values arrow's formatter cannot render (for example an
+        // unsupported encoding). Rather than failing the whole frame load, such a
+        // column is degraded: its cells show "?", and it is treated as opaque so
+        // it is left out of stats, sort, and filter.
+        let mut unreadable = vec![false; ncols];
 
         for batch in reader {
             let batch = batch?;
             let nrows = batch.num_rows();
-            let formatters: Vec<ArrayFormatter> = (0..batch.num_columns())
-                .map(|c| ArrayFormatter::try_new(batch.column(c).as_ref(), &options))
-                .collect::<Result<Vec<_>, _>>()?;
+            if first_batch {
+                for c in 0..batch.num_columns() {
+                    if types[c] == "fct" {
+                        fct_levels[c] = dict_value_count(batch.column(c).as_ref());
+                    }
+                }
+                first_batch = false;
+            }
+            // Opaque columns get no ArrayFormatter (their display is a
+            // placeholder). For the rest, a formatter that fails to build (for
+            // example a timestamp with a zone arrow cannot resolve) does not
+            // abort the load: the column is flagged unreadable and degraded.
+            let mut formatters: Vec<Option<ArrayFormatter>> = Vec::with_capacity(ncols);
+            for c in 0..batch.num_columns() {
+                let f = match render[c] {
+                    CellRender::Formatter => {
+                        match ArrayFormatter::try_new(batch.column(c).as_ref(), &options) {
+                            Ok(f) => Some(f),
+                            Err(_) => {
+                                if !unreadable[c] {
+                                    unreadable[c] = true;
+                                    // Treat like an opaque column: no stats, no
+                                    // sort or filter, missing-only summary.
+                                    list_col[c] = true;
+                                }
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                formatters.push(f);
+            }
             for r in 0..nrows {
                 let mut row = Vec::with_capacity(ncols);
                 for c in 0..batch.num_columns() {
-                    let val = formatters[c].value(r).to_string();
-                    if batch.column(c).is_null(r) {
+                    let is_null = batch.column(c).is_null(r);
+                    let mut val = match &render[c] {
+                        CellRender::Formatter => match formatters[c].as_ref() {
+                            Some(f) => f.value(r).to_string(),
+                            None => "?".to_string(),
+                        },
+                        CellRender::ListPlaceholder(child) => {
+                            match list_cell_len(batch.column(c).as_ref(), r) {
+                                Some(len) => format!("<{} [{}]>", child, len),
+                                None => "NA".to_string(),
+                            }
+                        }
+                        CellRender::BlobPlaceholder => {
+                            match blob_cell_len(batch.column(c).as_ref(), r) {
+                                Some(len) => format!("<blob [{} B]>", len),
+                                None => "NA".to_string(),
+                            }
+                        }
+                        CellRender::Tag(tag) => {
+                            if is_null {
+                                "NA".to_string()
+                            } else {
+                                format!("<{}>", tag)
+                            }
+                        }
+                        CellRender::Duration {
+                            arrow_unit_secs,
+                            r_unit_secs,
+                        } => match duration_raw(batch.column(c).as_ref(), r) {
+                            Some(raw) => {
+                                let v = raw as f64 * *arrow_unit_secs / *r_unit_secs;
+                                format!("{}", v)
+                            }
+                            None => "NA".to_string(),
+                        },
+                    };
+                    // arrow prints logicals lowercase; show them as R does, so a
+                    // value read off the viewer matches what a filter compares to.
+                    if types[c] == "lgl" {
+                        if val == "true" {
+                            val = "TRUE".to_string();
+                        } else if val == "false" {
+                            val = "FALSE".to_string();
+                        }
+                    }
+                    if is_null {
                         missing[c] += 1;
+                    } else if list_col[c] {
+                        // No value-level stats for opaque columns.
                     } else if numeric[c] {
                         if let Ok(f) = val.parse::<f64>() {
                             num_values[c].push(f);
                         }
                         num_unique[c].insert(val.clone());
+                    } else if types[c] == "str" {
+                        // str columns get a text summary computed over the built
+                        // rows in the finalize pass below; nothing to collect here.
                     } else {
                         *cat_counts[c].entry(val.clone()).or_insert(0) += 1;
                     }
@@ -264,6 +738,33 @@ impl RustdfApp {
         let mut stats: Vec<ColStats> = Vec::with_capacity(ncols);
         let mut levels: Vec<Option<Vec<String>>> = Vec::with_capacity(ncols);
         for c in 0..ncols {
+            if list_col[c] {
+                // List columns carry only a missing count; no levels, no detail.
+                stats.push(ColStats {
+                    missing: missing[c],
+                    unique: 0,
+                    detail: StatDetail::List,
+                });
+                levels.push(None);
+                continue;
+            }
+            if types[c] == "str" {
+                // Text summary over the built rows for this column.
+                let (uniq, empty, _nm, cdist, wdist, top) =
+                    text_stats(rows.iter().map(|r| r[c].as_str()));
+                stats.push(ColStats {
+                    missing: missing[c],
+                    unique: uniq,
+                    detail: StatDetail::Text {
+                        empty,
+                        chars: cdist,
+                        words: wdist,
+                        top,
+                    },
+                });
+                levels.push(None);
+                continue;
+            }
             let (unique, detail, level_list) = if numeric[c] {
                 let mut vals = std::mem::take(&mut num_values[c]);
                 let unique = num_unique[c].len();
@@ -315,7 +816,7 @@ impl RustdfApp {
                             .sum();
                         StatDetail::Logical { n_true, n_false }
                     }
-                    "date" | "datetime" => {
+                    "Date" | "POSIXct" => {
                         let mut keys: Vec<&String> = counts.keys().collect();
                         keys.sort();
                         match (keys.first(), keys.last()) {
@@ -374,6 +875,9 @@ impl RustdfApp {
             types,
             rows,
             numeric,
+            list_col,
+            fct_levels,
+            difftime_units: difftime_label,
             col_widths,
             row_order,
             sort_col: None,
@@ -393,6 +897,8 @@ impl RustdfApp {
             pending_h_scroll: None,
             h_offset: 0.0,
             last_body_width: 0.0,
+            expanded: None,
+            expanded_pos: None,
         })
     }
 
@@ -537,6 +1043,40 @@ impl RustdfApp {
     /// taken from the displayed NA sentinel here (the load-time stats use the
     /// exact Arrow nulls); the two agree except for literal "NA" string values.
     fn compute_column_stats(&self, col: usize) -> ColStats {
+        if self.list_col[col] {
+            let mut missing = 0usize;
+            for &r in &self.view_order {
+                let cell = self
+                    .rows
+                    .get(r)
+                    .and_then(|row| row.get(col))
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                if cell == "NA" {
+                    missing += 1;
+                }
+            }
+            return ColStats {
+                missing,
+                unique: 0,
+                detail: StatDetail::List,
+            };
+        }
+        if self.types[col] == "str" {
+            let (uniq, empty, nonmissing, cdist, wdist, top) =
+                text_stats(self.view_order.iter().map(|&r| self.rows[r][col].as_str()));
+            let missing = self.view_order.len().saturating_sub(nonmissing);
+            return ColStats {
+                missing,
+                unique: uniq,
+                detail: StatDetail::Text {
+                    empty,
+                    chars: cdist,
+                    words: wdist,
+                    top,
+                },
+            };
+        }
         let is_num = self.numeric[col];
         let mut missing = 0usize;
         let mut num_values: Vec<f64> = Vec::new();
@@ -606,7 +1146,7 @@ impl RustdfApp {
                         .sum();
                     StatDetail::Logical { n_true, n_false }
                 }
-                "date" | "datetime" => {
+                "Date" | "POSIXct" => {
                     let mut keys: Vec<&String> = cat_counts.keys().collect();
                     keys.sort();
                     match (keys.first(), keys.last()) {
@@ -712,6 +1252,38 @@ fn draw_text_bold(
     painter.text(pos, align, text, font, color);
 }
 
+/// Draw one data cell: only the first line, clipped to the column width with a
+/// trailing ellipsis when it does not fit, so a long or multi-line value stays
+/// on a single row instead of bleeding across the rows below. Display only; the
+/// full string stays in `rows` and exports in full. The monospace font makes the
+/// fit exact, since every glyph has the same advance width.
+fn draw_cell_text(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    text: &str,
+    color: egui::Color32,
+    size: f32,
+    align: egui::Align2,
+) {
+    let first = text.split('\n').next().unwrap_or(text);
+    let avail = (rect.width() - 12.0).max(0.0);
+    let font = egui::FontId::monospace(size);
+    let char_w = ui.fonts(|f| f.glyph_width(&font, '0')).max(1.0);
+    let max_chars = (avail / char_w).floor() as usize;
+    let n = first.chars().count();
+    let shown: String = if n <= max_chars {
+        first.to_string()
+    } else if max_chars == 0 {
+        String::new()
+    } else {
+        let keep = max_chars.saturating_sub(1);
+        let mut s: String = first.chars().take(keep).collect();
+        s.push('…');
+        s
+    };
+    draw_text(ui, rect, &shown, color, size, align, true);
+}
+
 fn draw_sort_arrow(ui: &egui::Ui, center: egui::Pos2, ascending: bool, color: egui::Color32) {
     let s = 5.0;
     let pts = if ascending {
@@ -735,6 +1307,10 @@ struct Descriptor {
     entry: String,
     title: String,
     full_rows: usize,
+    list_cols: Vec<usize>,
+    // (column index, R units) for difftime columns, carried over because arrow
+    // discards the units attribute.
+    difftime_units: Vec<(usize, String)>,
 }
 
 fn parse_descriptor(path: &Path) -> Option<Descriptor> {
@@ -742,6 +1318,8 @@ fn parse_descriptor(path: &Path) -> Option<Descriptor> {
     let mut entry: Option<String> = None;
     let mut title = String::new();
     let mut full_rows = 0usize;
+    let mut list_cols: Vec<usize> = Vec::new();
+    let mut difftime_units: Vec<(usize, String)> = Vec::new();
     for line in text.lines() {
         let line = line.trim();
         let (key, value) = match line.split_once('=') {
@@ -752,6 +1330,24 @@ fn parse_descriptor(path: &Path) -> Option<Descriptor> {
             "entry" => entry = Some(value.trim().to_string()),
             "title" => title = value.trim().to_string(),
             "full_rows" => full_rows = value.trim().parse().unwrap_or(0),
+            "list_cols" => {
+                list_cols = value
+                    .trim()
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<usize>().ok())
+                    .collect();
+            }
+            "difftime_units" => {
+                // Each entry is "index:unit", for example "7:mins".
+                difftime_units = value
+                    .trim()
+                    .split(',')
+                    .filter_map(|s| {
+                        let (idx, unit) = s.trim().split_once(':')?;
+                        Some((idx.trim().parse::<usize>().ok()?, unit.trim().to_string()))
+                    })
+                    .collect();
+            }
             _ => {}
         }
     }
@@ -759,6 +1355,8 @@ fn parse_descriptor(path: &Path) -> Option<Descriptor> {
         entry: entry?,
         title,
         full_rows,
+        list_cols,
+        difftime_units,
     })
 }
 
@@ -816,9 +1414,7 @@ impl RustdfApp {
         let want_copy = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
         if want_copy {
             let text = match self.selection {
-                Selection::Cell(orig, c) => {
-                    self.rows.get(orig).and_then(|row| row.get(c)).cloned()
-                }
+                Selection::Cell(orig, c) => self.rows.get(orig).and_then(|row| row.get(c)).cloned(),
                 Selection::Row(orig) => self.rows.get(orig).map(|row| row.join("\t")),
                 _ => None,
             };
@@ -936,6 +1532,12 @@ impl RustdfApp {
     /// the toolbar, and the close marker; this renders one frame's content and
     /// keeps its own sort, selection, resize, and scroll state.
     fn render(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        // Whether the expand popup was already open coming into this frame. The
+        // close checks (escape, selection moved, click outside) only run when it
+        // was, so the double-click that opens it is never misread as the outside
+        // click that closes it.
+        let was_expanded = self.expanded.is_some();
+
         // Keyboard navigation and copy run first, before the fields are read into
         // the locals below, so a key-driven selection or scroll change takes
         // effect in this same frame's draw.
@@ -968,12 +1570,15 @@ impl RustdfApp {
         let id = self.id;
         let headers = &self.headers;
         let types = &self.types;
+        let fct_levels = &self.fct_levels;
+        let difftime_units = &self.difftime_units;
         let rows = &self.rows;
         let widths = &self.col_widths;
         let order = &self.view_order;
         let numeric = &self.numeric;
         let levels = &self.levels;
         let filters = &self.filters;
+        let list_flags = &self.list_col;
         let sort_col = self.sort_col;
         let sort_dir = self.sort_dir;
         let selection = self.selection;
@@ -998,6 +1603,8 @@ impl RustdfApp {
         let mut clicked_index: Option<usize> = None;
         let mut clicked_cell: Option<(usize, usize)> = None;
         let mut clicked_dots: Option<usize> = None;
+        let mut double_clicked_cell: Option<(usize, usize)> = None;
+        let mut double_click_pos: Option<egui::Pos2> = None;
         let mut menu_action: Option<(usize, MenuAction)> = None;
         let mut filter_change: Option<(usize, FilterState)> = None;
 
@@ -1119,127 +1726,147 @@ impl RustdfApp {
                     data_h_area = data_h_area.horizontal_scroll_offset(off);
                 }
                 let h_out = data_h_area.show(ui, |ui| {
-                        ui.vertical(|ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+
+                        // header row
+                        ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                            let mut hdr_sel_rects: Vec<egui::Rect> = Vec::new();
+                            for c in 0..ncols {
+                                let w = widths[c];
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    egui::vec2(w, HEADER_H),
+                                    egui::Sense::click(),
+                                );
+                                let col_selected =
+                                    matches!(selection, Selection::Column(sc) if sc == c);
+                                let bg = if resp.hovered() {
+                                    header_hover
+                                } else {
+                                    header_bg
+                                };
+                                ui.painter().rect_filled(rect, 0.0, bg);
+                                if col_selected {
+                                    ui.painter().rect_filled(rect, 0.0, sel_fill);
+                                    hdr_sel_rects.push(rect);
+                                }
+                                ui.painter().rect_stroke(rect, 0.0, grid_stroke);
 
-                            // header row
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
-                                let mut hdr_sel_rects: Vec<egui::Rect> = Vec::new();
-                                for c in 0..ncols {
-                                    let w = widths[c];
-                                    let (rect, resp) = ui.allocate_exact_size(
-                                        egui::vec2(w, HEADER_H),
-                                        egui::Sense::click(),
-                                    );
-                                    let col_selected =
-                                        matches!(selection, Selection::Column(sc) if sc == c);
-                                    let bg = if resp.hovered() {
-                                        header_hover
-                                    } else {
-                                        header_bg
-                                    };
-                                    ui.painter().rect_filled(rect, 0.0, bg);
-                                    if col_selected {
-                                        ui.painter().rect_filled(rect, 0.0, sel_fill);
-                                        hdr_sel_rects.push(rect);
+                                let label_w = (w - 40.0).max(0.0);
+                                let name_rect = egui::Rect::from_min_size(
+                                    rect.min,
+                                    egui::vec2(label_w, HEADER_H * 0.6),
+                                );
+                                let type_rect = egui::Rect::from_min_size(
+                                    egui::pos2(rect.left(), rect.top() + HEADER_H * 0.6),
+                                    egui::vec2(label_w, HEADER_H * 0.4),
+                                );
+                                draw_text_bold(
+                                    ui,
+                                    name_rect,
+                                    &headers[c],
+                                    text_header,
+                                    14.0,
+                                    egui::Align2::LEFT_CENTER,
+                                );
+                                let type_text = if types[c] == "fct" {
+                                    match fct_levels[c] {
+                                        Some(n) => format!("fct({})", n),
+                                        None => "fct".to_string(),
                                     }
-                                    ui.painter().rect_stroke(rect, 0.0, grid_stroke);
-
-                                    let label_w = (w - 40.0).max(0.0);
-                                    let name_rect = egui::Rect::from_min_size(
-                                        rect.min,
-                                        egui::vec2(label_w, HEADER_H * 0.6),
-                                    );
-                                    let type_rect = egui::Rect::from_min_size(
-                                        egui::pos2(rect.left(), rect.top() + HEADER_H * 0.6),
-                                        egui::vec2(label_w, HEADER_H * 0.4),
-                                    );
-                                    draw_text_bold(
-                                        ui,
-                                        name_rect,
-                                        &headers[c],
-                                        text_header,
-                                        14.0,
-                                        egui::Align2::LEFT_CENTER,
-                                    );
-                                    draw_text(
-                                        ui,
-                                        type_rect,
-                                        &types[c],
-                                        text_white,
-                                        11.0,
-                                        egui::Align2::LEFT_CENTER,
-                                        false,
-                                    );
-
-                                    if sort_col == Some(c) {
-                                        let cx = rect.right() - 36.0;
-                                        let cy = rect.top() + HEADER_H * 0.50;
-                                        draw_sort_arrow(
-                                            ui,
-                                            egui::pos2(cx, cy),
-                                            sort_dir == SortDir::Asc,
-                                            accent,
-                                        );
+                                } else if types[c] == "difftime" {
+                                    match &difftime_units[c] {
+                                        Some(u) => format!("difftime ({})", u),
+                                        None => "difftime".to_string(),
                                     }
+                                } else {
+                                    types[c].clone()
+                                };
+                                draw_text(
+                                    ui,
+                                    type_rect,
+                                    &type_text,
+                                    text_white,
+                                    12.0,
+                                    egui::Align2::LEFT_CENTER,
+                                    false,
+                                );
 
-                                    let dots_rect = egui::Rect::from_min_max(
-                                        egui::pos2(rect.right() - 28.0, rect.top()),
-                                        egui::pos2(rect.right() - 4.0, rect.bottom()),
-                                    );
-                                    let dots_resp = ui.interact(
-                                        dots_rect,
-                                        egui::Id::new(("rustdf_dots", id, c)),
-                                        egui::Sense::click(),
-                                    );
-                                    let dots_color = if dots_resp.hovered() {
-                                        dots_hover_color
-                                    } else {
-                                        accent
-                                    };
-                                    let dcx = dots_rect.center().x;
-                                    let dcy = dots_rect.center().y;
-                                    let dot_r = 1.5;
-                                    let dot_s = 4.0;
-                                    ui.painter().circle_filled(
-                                        egui::pos2(dcx, dcy - dot_s),
-                                        dot_r,
-                                        dots_color,
-                                    );
-                                    ui.painter().circle_filled(
-                                        egui::pos2(dcx, dcy),
-                                        dot_r,
-                                        dots_color,
-                                    );
-                                    ui.painter().circle_filled(
-                                        egui::pos2(dcx, dcy + dot_s),
-                                        dot_r,
-                                        dots_color,
-                                    );
-
-                                    if dots_resp.clicked() {
-                                        clicked_dots = Some(c);
-                                    } else if resp.clicked() {
-                                        clicked_col = Some(c);
-                                    }
-
-                                    let popup_id = egui::Id::new(("rustdf_menu", id, c));
-                                    let is_sorted = sort_col == Some(c);
-                                    egui::popup::popup_below_widget(
+                                if sort_col == Some(c) {
+                                    let cx = rect.right() - 36.0;
+                                    let cy = rect.top() + HEADER_H * 0.50;
+                                    draw_sort_arrow(
                                         ui,
-                                        popup_id,
-                                        &dots_resp,
-                                        egui::PopupCloseBehavior::CloseOnClickOutside,
-                                        |ui| {
-                                            ui.set_min_width(180.0);
-                                            if ui
-                                                .add_enabled(true, egui::Button::new("Copy Column"))
-                                                .clicked()
-                                            {
-                                                menu_action = Some((c, MenuAction::Copy));
-                                                ui.memory_mut(|m| m.close_popup());
-                                            }
+                                        egui::pos2(cx, cy),
+                                        sort_dir == SortDir::Asc,
+                                        accent,
+                                    );
+                                }
+
+                                let dots_rect = egui::Rect::from_min_max(
+                                    egui::pos2(rect.right() - 28.0, rect.top()),
+                                    egui::pos2(rect.right() - 4.0, rect.bottom()),
+                                );
+                                let dots_resp = ui.interact(
+                                    dots_rect,
+                                    egui::Id::new(("rustdf_dots", id, c)),
+                                    egui::Sense::click(),
+                                );
+                                let dots_color = if dots_resp.hovered() {
+                                    dots_hover_color
+                                } else {
+                                    accent
+                                };
+                                let dcx = dots_rect.center().x;
+                                let dcy = dots_rect.center().y;
+                                let dot_r = 1.5;
+                                let dot_s = 4.0;
+                                ui.painter().circle_filled(
+                                    egui::pos2(dcx, dcy - dot_s),
+                                    dot_r,
+                                    dots_color,
+                                );
+                                ui.painter()
+                                    .circle_filled(egui::pos2(dcx, dcy), dot_r, dots_color);
+                                ui.painter().circle_filled(
+                                    egui::pos2(dcx, dcy + dot_s),
+                                    dot_r,
+                                    dots_color,
+                                );
+
+                                if dots_resp.clicked() {
+                                    clicked_dots = Some(c);
+                                } else if resp.clicked() {
+                                    clicked_col = Some(c);
+                                }
+
+                                let popup_id = egui::Id::new(("rustdf_menu", id, c));
+                                let is_sorted = sort_col == Some(c);
+                                egui::popup::popup_below_widget(
+                                    ui,
+                                    popup_id,
+                                    &dots_resp,
+                                    egui::PopupCloseBehavior::CloseOnClickOutside,
+                                    |ui| {
+                                        ui.set_min_width(180.0);
+                                        if ui
+                                            .add_enabled(true, egui::Button::new("Copy Column"))
+                                            .clicked()
+                                        {
+                                            menu_action = Some((c, MenuAction::Copy));
+                                            ui.memory_mut(|m| m.close_popup());
+                                        }
+                                        if list_flags[c] {
+                                            ui.separator();
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "(list column, sort and filter unavailable)",
+                                                )
+                                                .weak(),
+                                            );
+                                        }
+                                        if !list_flags[c] {
                                             ui.separator();
                                             if ui
                                                 .add_enabled(
@@ -1449,107 +2076,108 @@ impl RustdfApp {
                                                 filter_change = Some((c, FilterState::None));
                                                 ui.memory_mut(|m| m.close_popup());
                                             }
-                                        },
-                                    );
-
-                                    let handle = egui::Rect::from_min_max(
-                                        egui::pos2(rect.right() - 4.0, rect.top()),
-                                        egui::pos2(rect.right() + 4.0, rect.bottom()),
-                                    );
-                                    let rresp = ui.interact(
-                                        handle,
-                                        egui::Id::new(("rustdf_resize", id, c)),
-                                        egui::Sense::drag(),
-                                    );
-                                    if rresp.hovered() || rresp.dragged() {
-                                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
-                                        let line = egui::Rect::from_min_max(
-                                            egui::pos2(rect.right() - 1.0, rect.top()),
-                                            egui::pos2(rect.right() + 1.0, rect.bottom()),
-                                        );
-                                        ui.painter().rect_filled(line, 0.0, accent);
-                                    }
-                                    if rresp.dragged() {
-                                        deltas[c] += rresp.drag_delta().x;
-                                    }
-                                }
-                                for r in &hdr_sel_rects {
-                                    ui.painter().rect_stroke(*r, 0.0, sel_stroke);
-                                }
-                            });
-
-                            // data body
-                            let mut data_v_area = egui::ScrollArea::vertical()
-                                .id_salt(("data_v", id))
-                                .auto_shrink([true, false])
-                                .scroll_bar_visibility(
-                                    egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                        }
+                                    },
                                 );
-                            if let Some(off) = forced_scroll {
-                                data_v_area = data_v_area.vertical_scroll_offset(off);
+
+                                let handle = egui::Rect::from_min_max(
+                                    egui::pos2(rect.right() - 4.0, rect.top()),
+                                    egui::pos2(rect.right() + 4.0, rect.bottom()),
+                                );
+                                let rresp = ui.interact(
+                                    handle,
+                                    egui::Id::new(("rustdf_resize", id, c)),
+                                    egui::Sense::drag(),
+                                );
+                                if rresp.hovered() || rresp.dragged() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
+                                    let line = egui::Rect::from_min_max(
+                                        egui::pos2(rect.right() - 1.0, rect.top()),
+                                        egui::pos2(rect.right() + 1.0, rect.bottom()),
+                                    );
+                                    ui.painter().rect_filled(line, 0.0, accent);
+                                }
+                                if rresp.dragged() {
+                                    deltas[c] += rresp.drag_delta().x;
+                                }
                             }
-                            let out = data_v_area.show_rows(ui, ROW_H, visible, |ui, row_range| {
+                            for r in &hdr_sel_rects {
+                                ui.painter().rect_stroke(*r, 0.0, sel_stroke);
+                            }
+                        });
+
+                        // data body
+                        let mut data_v_area = egui::ScrollArea::vertical()
+                            .id_salt(("data_v", id))
+                            .auto_shrink([true, false])
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                            );
+                        if let Some(off) = forced_scroll {
+                            data_v_area = data_v_area.vertical_scroll_offset(off);
+                        }
+                        let out = data_v_area.show_rows(ui, ROW_H, visible, |ui, row_range| {
+                            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                            let mut data_sel_rects: Vec<egui::Rect> = Vec::new();
+                            for r in row_range {
+                                let orig = if order.is_empty() { r } else { order[r] };
+                                ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
-                                    let mut data_sel_rects: Vec<egui::Rect> = Vec::new();
-                                    for r in row_range {
-                                        let orig = if order.is_empty() { r } else { order[r] };
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
-                                            for c in 0..ncols {
-                                                let w = widths[c];
-                                                let (rect, resp) = ui.allocate_exact_size(
-                                                    egui::vec2(w, ROW_H),
-                                                    egui::Sense::click(),
-                                                );
-                                                let (this_fill, this_border) = match selection {
-                                                    Selection::Column(sc) if sc == c => {
-                                                        (true, true)
-                                                    }
-                                                    Selection::Row(sr) if sr == orig => {
-                                                        (true, true)
-                                                    }
-                                                    Selection::Cell(scr, scc)
-                                                        if scr == orig && scc == c =>
-                                                    {
-                                                        (false, true)
-                                                    }
-                                                    _ => (false, false),
-                                                };
-                                                if this_fill {
-                                                    ui.painter().rect_filled(rect, 0.0, sel_fill);
-                                                }
-                                                ui.painter().rect_stroke(rect, 0.0, grid_stroke);
-                                                if this_border {
-                                                    data_sel_rects.push(rect);
-                                                }
-                                                let val = rows
-                                                    .get(orig)
-                                                    .and_then(|row| row.get(c))
-                                                    .map(|s| s.as_str())
-                                                    .unwrap_or("");
-                                                let align = if numeric[c] {
-                                                    egui::Align2::RIGHT_CENTER
-                                                } else {
-                                                    egui::Align2::LEFT_CENTER
-                                                };
-                                                let color =
-                                                    if val == "NA" { text_na } else { text_data };
-                                                draw_text(ui, rect, val, color, 13.0, align, true);
-                                                if resp.clicked() {
-                                                    clicked_cell = Some((orig, c));
-                                                }
+                                    for c in 0..ncols {
+                                        let w = widths[c];
+                                        let (rect, resp) = ui.allocate_exact_size(
+                                            egui::vec2(w, ROW_H),
+                                            egui::Sense::click(),
+                                        );
+                                        let (this_fill, this_border) = match selection {
+                                            Selection::Column(sc) if sc == c => (true, true),
+                                            Selection::Row(sr) if sr == orig => (true, true),
+                                            Selection::Cell(scr, scc)
+                                                if scr == orig && scc == c =>
+                                            {
+                                                (false, true)
                                             }
-                                        });
-                                    }
-                                    for r in &data_sel_rects {
-                                        ui.painter().rect_stroke(*r, 0.0, sel_stroke);
+                                            _ => (false, false),
+                                        };
+                                        if this_fill {
+                                            ui.painter().rect_filled(rect, 0.0, sel_fill);
+                                        }
+                                        ui.painter().rect_stroke(rect, 0.0, grid_stroke);
+                                        if this_border {
+                                            data_sel_rects.push(rect);
+                                        }
+                                        let val = rows
+                                            .get(orig)
+                                            .and_then(|row| row.get(c))
+                                            .map(|s| s.as_str())
+                                            .unwrap_or("");
+                                        let align = if numeric[c] {
+                                            egui::Align2::RIGHT_CENTER
+                                        } else {
+                                            egui::Align2::LEFT_CENTER
+                                        };
+                                        let color = if val == "NA" { text_na } else { text_data };
+                                        draw_cell_text(ui, rect, val, color, 13.0, align);
+                                        if resp.clicked() {
+                                            clicked_cell = Some((orig, c));
+                                        }
+                                        if resp.double_clicked() {
+                                            double_clicked_cell = Some((orig, c));
+                                            double_click_pos =
+                                                Some(egui::pos2(rect.left(), rect.bottom()));
+                                        }
                                     }
                                 });
-                            seen_body_h = out.inner_rect.height();
-                            out.state.offset.y
-                        })
-                        .inner
-                    });
+                            }
+                            for r in &data_sel_rects {
+                                ui.painter().rect_stroke(*r, 0.0, sel_stroke);
+                            }
+                        });
+                        seen_body_h = out.inner_rect.height();
+                        out.state.offset.y
+                    })
+                    .inner
+                });
                 seen_h_off = h_out.state.offset.x;
                 seen_body_w = h_out.inner_rect.width();
                 h_out.inner
@@ -1613,12 +2241,85 @@ impl RustdfApp {
             self.selection = Selection::Cell(orig, c);
             changed = true;
         }
+        // A double-click selects the cell and, for chr columns only, opens the
+        // expand popup anchored at the cell's lower-left.
+        if let Some((orig, c)) = double_clicked_cell {
+            self.selection = Selection::Cell(orig, c);
+            if self
+                .types
+                .get(c)
+                .map(|t| t.as_str() == "str")
+                .unwrap_or(false)
+            {
+                self.expanded = Some((orig, c));
+                self.expanded_pos = double_click_pos;
+            }
+            changed = true;
+        }
+
+        // Expand popup. Drawn before the outside-click handling so a click inside
+        // it is not read as a click that clears the table selection. It has no
+        // title bar (so no drag handle and no close X) and closes on Escape, on
+        // the selection moving off its cell, or on any click outside it. The
+        // close checks are skipped on the frame it opens or switches cells, so
+        // the double-click that opens it is never the click that closes it.
+        let mut popup_rect: Option<egui::Rect> = None;
+        if let Some((orig, c)) = self.expanded {
+            let full = self
+                .rows
+                .get(orig)
+                .and_then(|row| row.get(c))
+                .cloned()
+                .unwrap_or_default();
+            let anchor = self
+                .expanded_pos
+                .unwrap_or_else(|| ctx.screen_rect().center());
+            let screen = ctx.screen_rect();
+            let win = egui::Window::new("rustgd_expand")
+                .id(egui::Id::new(("rustdf_expand", self.id)))
+                .title_bar(false)
+                .resizable(true)
+                .constrain_to(screen)
+                .default_size([440.0, 280.0])
+                .fixed_pos(anchor)
+                .show(ctx, |ui| {
+                    if ui.button("Copy").clicked() {
+                        ui.ctx().copy_text(full.clone());
+                    }
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.label(full.as_str());
+                        });
+                });
+            popup_rect = win.as_ref().map(|r| r.response.rect);
+            changed = true;
+        }
+        let click_in_popup = matches!(
+            (popup_rect, ctx.input(|i| i.pointer.interact_pos())),
+            (Some(r), Some(p)) if r.contains(p)
+        );
+        if let Some((orig, c)) = self.expanded {
+            if was_expanded && double_clicked_cell.is_none() {
+                let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+                let moved = self.selection != Selection::Cell(orig, c);
+                let any_click = ctx.input(|i| i.pointer.any_click());
+                if escape || moved || (any_click && !click_in_popup) {
+                    self.expanded = None;
+                    self.expanded_pos = None;
+                }
+            }
+        }
+
         let any_interaction = clicked_col.is_some()
             || clicked_index.is_some()
             || clicked_cell.is_some()
             || clicked_dots.is_some()
+            || double_clicked_cell.is_some()
             || menu_action.is_some()
-            || filter_change.is_some();
+            || filter_change.is_some()
+            || click_in_popup;
         let outside_click = !any_interaction && ctx.input(|i| i.pointer.any_click());
         if outside_click && self.selection != Selection::None {
             self.selection = Selection::None;
@@ -1643,6 +2344,8 @@ struct FrameMeta {
     entry: String,
     title: String,
     full_rows: usize,
+    list_cols: Vec<usize>,
+    difftime_units: Vec<(usize, String)>,
 }
 
 /// The window: a gallery over every frame in the directory. It owns the list
@@ -1700,6 +2403,8 @@ impl GalleryApp {
                             entry: desc.entry,
                             title: desc.title,
                             full_rows: desc.full_rows,
+                            list_cols: desc.list_cols,
+                            difftime_units: desc.difftime_units,
                         });
                     }
                 }
@@ -1866,6 +2571,46 @@ impl eframe::App for GalleryApp {
                     if export.clicked() {
                         do_export = true;
                     }
+                    // Click-to-open guidance, sitting just left of Export (added
+                    // after it in this right-to-left layout). Explains that the
+                    // save dialog's extension picks the format, with a line on
+                    // each format's tradeoffs.
+                    let guidance = ui.add(egui::Button::new(egui::RichText::new("?").size(14.0)));
+                    let guidance_id = egui::Id::new("export_guidance");
+                    if guidance.clicked() {
+                        ui.memory_mut(|m| m.toggle_popup(guidance_id));
+                    }
+                    egui::popup::popup_below_widget(
+                        ui,
+                        guidance_id,
+                        &guidance,
+                        egui::PopupCloseBehavior::CloseOnClickOutside,
+                        |ui| {
+                            ui.set_max_width(380.0);
+                            ui.label(
+                                "The file extension you type in the save dialog picks the format.",
+                            );
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("Arrow (.arrow)").strong());
+                            ui.label(
+                                "Lossless and keeps every column, including list columns, but \
+                                 needs the arrow package or pyarrow to reopen and is not \
+                                 human-readable.",
+                            );
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("CSV (.csv)").strong());
+                            ui.label(
+                                "Opens anywhere and is readable, but is flat: list columns \
+                                 export blank and every column reads back as text.",
+                            );
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("Excel (.xlsx)").strong());
+                            ui.label(
+                                "Opens in Excel for non-R collaborators, but is flat like CSV: \
+                                 list columns export blank, with a cap of about 1,048,576 rows.",
+                            );
+                        },
+                    );
                 });
             });
             ui.add_space(4.0);
@@ -1886,11 +2631,16 @@ impl eframe::App for GalleryApp {
         // so it runs first; a clear then changes the set and the refresh
         // reconciles metas, loaded, and pos; nav moves within the updated set.
         if do_export {
-            let info = self
-                .metas
-                .get(self.pos)
-                .map(|m| (m.index, m.entry.clone(), m.title.clone()));
-            if let Some((idx, entry, title)) = info {
+            let info = self.metas.get(self.pos).map(|m| {
+                (
+                    m.index,
+                    m.entry.clone(),
+                    m.title.clone(),
+                    m.list_cols.clone(),
+                    m.difftime_units.clone(),
+                )
+            });
+            if let Some((idx, entry, title, list_cols, difftime_units)) = info {
                 let arrow_path = self.frames_dir.join(&entry);
                 let base = if title.is_empty() {
                     format!("frame-{}", idx)
@@ -1907,7 +2657,17 @@ impl eframe::App for GalleryApp {
                     ),
                     None => (Vec::new(), true),
                 };
-                export_frame(&arrow_path, &format!("{}.arrow", base), &indices, full);
+                let marked: HashSet<usize> = list_cols.into_iter().collect();
+                let difftime_units: HashMap<usize, String> =
+                    difftime_units.into_iter().collect();
+                export_frame(
+                    &arrow_path,
+                    &format!("{}.arrow", base),
+                    &indices,
+                    full,
+                    &marked,
+                    &difftime_units,
+                );
             }
         }
 
@@ -1935,13 +2695,19 @@ impl eframe::App for GalleryApp {
         let active: Option<u32> = if self.metas.is_empty() {
             None
         } else {
-            let (idx, entry, full_rows) = {
+            let (idx, entry, full_rows, marked, difftime_units) = {
                 let meta = &self.metas[self.pos];
-                (meta.index, meta.entry.clone(), meta.full_rows)
+                (
+                    meta.index,
+                    meta.entry.clone(),
+                    meta.full_rows,
+                    meta.list_cols.iter().copied().collect::<HashSet<usize>>(),
+                    meta.difftime_units.iter().cloned().collect::<HashMap<usize, String>>(),
+                )
             };
             if !self.loaded.contains_key(&idx) {
                 let path = self.frames_dir.join(&entry);
-                match RustdfApp::from_arrow_ipc(&path, idx, full_rows) {
+                match RustdfApp::from_arrow_ipc(&path, idx, full_rows, &marked, &difftime_units) {
                     Ok(app) => {
                         self.loaded.insert(idx, app);
                     }
@@ -2038,16 +2804,36 @@ fn render_summary(ui: &mut egui::Ui, frame: &RustdfApp) {
             } else {
                 0.0
             };
+            let is_str = frame.types[col] == "str";
             egui::Grid::new(("summary_head", frame.id, col))
                 .num_columns(2)
                 .spacing([12.0, 4.0])
                 .show(ui, |ui| {
-                    ui.label("missing");
-                    ui.label(format!("{} ({:.1}%)", st.missing, pct));
-                    ui.end_row();
-                    ui.label("unique");
-                    ui.label(format!("{}", st.unique));
-                    ui.end_row();
+                    if is_str {
+                        let empty = match &st.detail {
+                            StatDetail::Text { empty, .. } => *empty,
+                            _ => 0,
+                        };
+                        let non_missing = denom.saturating_sub(st.missing);
+                        ui.label("non-missing");
+                        ui.label(format!("{}", non_missing));
+                        ui.end_row();
+                        ui.label("empty");
+                        ui.label(format!("{}", empty));
+                        ui.end_row();
+                        ui.label("unique");
+                        ui.label(format!("{}", st.unique));
+                        ui.end_row();
+                    } else {
+                        ui.label("missing");
+                        ui.label(format!("{} ({:.1}%)", st.missing, pct));
+                        ui.end_row();
+                        if !frame.list_col[col] {
+                            ui.label("unique");
+                            ui.label(format!("{}", st.unique));
+                            ui.end_row();
+                        }
+                    }
                 });
             ui.separator();
 
@@ -2095,10 +2881,10 @@ fn render_summary(ui: &mut egui::Ui, frame: &RustdfApp) {
                         .spacing([12.0, 4.0])
                         .show(ui, |ui| {
                             ui.label("min");
-                            ui.label(min);
+                            ui.label(clip_label(min, 48));
                             ui.end_row();
                             ui.label("max");
-                            ui.label(max);
+                            ui.label(clip_label(max, 48));
                             ui.end_row();
                         });
                 }
@@ -2118,7 +2904,7 @@ fn render_summary(ui: &mut egui::Ui, frame: &RustdfApp) {
                         .spacing([12.0, 4.0])
                         .show(ui, |ui| {
                             for (val, cnt) in top {
-                                ui.label(val);
+                                ui.label(clip_label(val, 48));
                                 ui.label(format!("{}", cnt));
                                 ui.end_row();
                             }
@@ -2131,6 +2917,75 @@ fn render_summary(ui: &mut egui::Ui, frame: &RustdfApp) {
                                 ui.end_row();
                             }
                         });
+                }
+                StatDetail::Text {
+                    empty: _,
+                    chars,
+                    words,
+                    top,
+                } => {
+                    let non_missing = denom.saturating_sub(st.missing);
+                    if non_missing == 0 {
+                        ui.label("(no non-missing values)");
+                    } else {
+                        ui.label(egui::RichText::new("characters").weak());
+                        ui.add_space(2.0);
+                        egui::Grid::new(("summary_chars", frame.id, col))
+                            .num_columns(2)
+                            .spacing([12.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.label("min");
+                                ui.label(fmt_num(chars.min));
+                                ui.end_row();
+                                ui.label("median");
+                                ui.label(fmt_num(chars.median));
+                                ui.end_row();
+                                ui.label("mean");
+                                ui.label(fmt_num(chars.mean));
+                                ui.end_row();
+                                ui.label("max");
+                                ui.label(fmt_num(chars.max));
+                                ui.end_row();
+                            });
+                        ui.separator();
+                        ui.label(egui::RichText::new("words").weak());
+                        ui.add_space(2.0);
+                        egui::Grid::new(("summary_words", frame.id, col))
+                            .num_columns(2)
+                            .spacing([12.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.label("min");
+                                ui.label(fmt_num(words.min));
+                                ui.end_row();
+                                ui.label("median");
+                                ui.label(fmt_num(words.median));
+                                ui.end_row();
+                                ui.label("mean");
+                                ui.label(fmt_num(words.mean));
+                                ui.end_row();
+                                ui.label("max");
+                                ui.label(fmt_num(words.max));
+                                ui.end_row();
+                            });
+                        if !top.is_empty() {
+                            ui.separator();
+                            ui.label(egui::RichText::new("top terms").weak());
+                            ui.add_space(2.0);
+                            egui::Grid::new(("summary_terms", frame.id, col))
+                                .num_columns(2)
+                                .spacing([12.0, 4.0])
+                                .show(ui, |ui| {
+                                    for (term, cnt) in top {
+                                        ui.label(clip_label(term, 32));
+                                        ui.label(format!("{}", cnt));
+                                        ui.end_row();
+                                    }
+                                });
+                        }
+                    }
+                }
+                StatDetail::List => {
+                    ui.label(format!("({} column)", frame.types[col]));
                 }
                 StatDetail::Empty => {
                     ui.label("(no non-missing values)");
@@ -2155,10 +3010,19 @@ fn fmt_num(x: f64) -> String {
 
 /// Save a frame out. Opens a native save dialog with the frame's name
 /// pre-filled and an Arrow extension; whatever extension you leave on the name
-/// decides the format. ".csv" writes CSV read from the Arrow file (values
-/// intact, types flattened); anything else copies the Arrow file verbatim,
-/// which is lossless and rereads with arrow::read_feather() in R or pyarrow.
-fn export_frame(arrow_path: &Path, default_name: &str, indices: &[usize], full: bool) {
+/// decides the format. ".csv" and ".xlsx" write flat files (read from the Arrow
+/// file) in which list columns are blank, since neither format can hold them;
+/// anything else writes Arrow, which is lossless and keeps every column. The
+/// `marked` set holds the columns the R side stringified into list placeholders,
+/// which are blanked in the flat exports alongside the real Arrow list columns.
+fn export_frame(
+    arrow_path: &Path,
+    default_name: &str,
+    indices: &[usize],
+    full: bool,
+    marked: &HashSet<usize>,
+    difftime_units: &HashMap<usize, String>,
+) {
     let dest = match rfd::FileDialog::new()
         .set_file_name(default_name)
         .save_file()
@@ -2166,24 +3030,126 @@ fn export_frame(arrow_path: &Path, default_name: &str, indices: &[usize], full: 
         Some(p) => p,
         None => return,
     };
-    let is_csv = dest
+    let ext = dest
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("csv"))
-        .unwrap_or(false);
-    let result = if is_csv {
-        write_csv(arrow_path, &dest, if full { None } else { Some(indices) })
-    } else if full {
-        // Whole frame in original order: a plain lossless file copy.
-        fs::copy(arrow_path, &dest)
-            .map(|_| ())
-            .map_err(|e| e.into())
-    } else {
-        write_arrow_filtered(arrow_path, &dest, indices)
+        .map(|e| e.to_ascii_lowercase());
+    let result = match ext.as_deref() {
+        Some("csv") => write_csv(
+            arrow_path,
+            &dest,
+            if full { None } else { Some(indices) },
+            marked,
+            difftime_units,
+        ),
+        Some("xlsx") => write_xlsx(arrow_path, &dest, indices, marked, difftime_units),
+        _ if full => {
+            // Whole frame in original order: a plain lossless file copy.
+            fs::copy(arrow_path, &dest)
+                .map(|_| ())
+                .map_err(|e| e.into())
+        }
+        _ => write_arrow_filtered(arrow_path, &dest, indices),
     };
     if let Err(e) = result {
         eprintln!("rustgd-frames: export failed: {}", e);
     }
+}
+
+/// Per-column flag for the flat exports: a column is blanked when it is opaque
+/// (a real Arrow list, blob, struct, map, or union, detected from the schema) or
+/// one the R side stringified into list placeholders (flagged in `marked`).
+fn export_blank_flags(schema: &Schema, marked: &HashSet<usize>) -> Vec<bool> {
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(c, f)| is_opaque(f.data_type()) || marked.contains(&c))
+        .collect()
+}
+
+/// Which flat export a column is being shaped for. CSV is all text, so logicals
+/// become "TRUE"/"FALSE" and difftimes become their numeric string. xlsx keeps
+/// real types, so logicals stay boolean (Excel shows TRUE/FALSE) and difftimes
+/// become real numbers.
+#[derive(Clone, Copy)]
+enum ExportTarget {
+    Csv,
+    Xlsx,
+}
+
+/// Reshape a batch into what a flat export should contain, so CSV and xlsx match
+/// what R means by each type. Opaque columns (lists, blob, struct, and the
+/// R-stringified placeholders in `marked`) are blanked, since neither format can
+/// hold them. Logical columns are written as R's `TRUE`/`FALSE` rather than
+/// arrow's lowercase. difftime columns, whose R units arrow discarded but the
+/// descriptor preserved, are converted back to the bare numeric value in those
+/// units, so a 30-minute duration exports as 30, not arrow's 1800-second form.
+/// Every other column passes through untouched. The Arrow export never calls
+/// this; it stays byte-for-byte lossless.
+fn flatten_for_export(
+    batch: &arrow::record_batch::RecordBatch,
+    blank: &[bool],
+    difftime_units: &HashMap<usize, String>,
+    target: ExportTarget,
+) -> Result<arrow::record_batch::RecordBatch, Box<dyn std::error::Error>> {
+    use arrow::array::{BooleanArray, Float64Array};
+    let n = batch.num_rows();
+    let schema = batch.schema();
+    let mut fields: Vec<arrow::datatypes::FieldRef> = Vec::with_capacity(batch.num_columns());
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for c in 0..batch.num_columns() {
+        let f = &schema.fields()[c];
+        let dt = f.data_type();
+        if blank[c] {
+            let nulls = StringArray::from(vec![None as Option<&str>; n]);
+            cols.push(Arc::new(nulls) as ArrayRef);
+            fields.push(Arc::new(Field::new(f.name().to_string(), DataType::Utf8, true)));
+        } else if matches!(dt, DataType::Boolean) && matches!(target, ExportTarget::Csv) {
+            let src = batch.column(c).as_any().downcast_ref::<BooleanArray>();
+            let arr: StringArray = (0..n)
+                .map(|r| match src {
+                    Some(b) if !b.is_null(r) => {
+                        Some(if b.value(r) { "TRUE" } else { "FALSE" })
+                    }
+                    _ => None,
+                })
+                .collect();
+            cols.push(Arc::new(arr) as ArrayRef);
+            fields.push(Arc::new(Field::new(f.name().to_string(), DataType::Utf8, true)));
+        } else if let (DataType::Duration(tu), Some(unit)) = (dt, difftime_units.get(&c)) {
+            let aus = arrow_duration_unit_secs(tu);
+            let rus = r_difftime_unit_secs(unit);
+            let src = batch.column(c).as_ref();
+            match target {
+                ExportTarget::Csv => {
+                    let arr: StringArray = (0..n)
+                        .map(|r| {
+                            duration_raw(src, r).map(|raw| format!("{}", raw as f64 * aus / rus))
+                        })
+                        .collect();
+                    cols.push(Arc::new(arr) as ArrayRef);
+                    fields.push(Arc::new(Field::new(f.name().to_string(), DataType::Utf8, true)));
+                }
+                ExportTarget::Xlsx => {
+                    let arr: Float64Array = (0..n)
+                        .map(|r| duration_raw(src, r).map(|raw| raw as f64 * aus / rus))
+                        .collect();
+                    cols.push(Arc::new(arr) as ArrayRef);
+                    fields.push(Arc::new(Field::new(
+                        f.name().to_string(),
+                        DataType::Float64,
+                        true,
+                    )));
+                }
+            }
+        } else {
+            cols.push(batch.column(c).clone());
+            fields.push(f.clone());
+        }
+    }
+    let new_schema = Arc::new(Schema::new(fields));
+    Ok(arrow::record_batch::RecordBatch::try_new(new_schema, cols)?)
 }
 
 /// Read every record batch from an Arrow IPC file into one combined batch.
@@ -2223,11 +3189,15 @@ fn take_rows(
 }
 
 /// Read an Arrow IPC file and write CSV with a header. With `indices`, only
-/// those rows are written, in that order; otherwise the whole file.
+/// those rows are written, in that order; otherwise the whole file. List columns
+/// (real Arrow lists and the R-stringified placeholder columns in `marked`) are
+/// written blank, since CSV is flat and cannot represent them.
 fn write_csv(
     arrow_path: &Path,
     dest: &Path,
     indices: Option<&[usize]>,
+    marked: &HashSet<usize>,
+    difftime_units: &HashMap<usize, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let output = File::create(dest)?;
     let mut writer = WriterBuilder::new().with_header(true).build(output);
@@ -2235,16 +3205,125 @@ fn write_csv(
         None => {
             let input = File::open(arrow_path)?;
             let reader = FileReader::try_new(input, None)?;
+            let blank = export_blank_flags(reader.schema().as_ref(), marked);
             for batch in reader {
-                writer.write(&batch?)?;
+                let flat =
+                    flatten_for_export(&batch?, &blank, difftime_units, ExportTarget::Csv)?;
+                writer.write(&flat)?;
             }
         }
         Some(ix) => {
-            let (_schema, combined) = read_combined(arrow_path)?;
+            let (schema, combined) = read_combined(arrow_path)?;
+            let blank = export_blank_flags(schema.as_ref(), marked);
             let taken = take_rows(&combined, ix)?;
-            writer.write(&taken)?;
+            let flat = flatten_for_export(&taken, &blank, difftime_units, ExportTarget::Csv)?;
+            writer.write(&flat)?;
         }
     }
+    Ok(())
+}
+
+/// Excel's hard limit on rows per sheet, including the header row.
+const EXCEL_MAX_ROWS: usize = 1_048_576;
+/// Excel's hard limit on characters in a single cell.
+const EXCEL_MAX_CELL_CHARS: usize = 32_767;
+
+/// Read an Arrow IPC file and write the given rows (in order) to an .xlsx file.
+/// Numeric columns become Excel numbers, logicals become Excel booleans, and
+/// everything else is written as text (dates and datetimes as their displayed
+/// strings). Null cells are left blank. List columns (real Arrow lists and the
+/// R-stringified placeholder columns in `marked`) are written blank, matching
+/// CSV and what R's own writers do with list columns. Refuses rather than
+/// truncating if the row count would exceed Excel's sheet limit.
+fn write_xlsx(
+    arrow_path: &Path,
+    dest: &Path,
+    indices: &[usize],
+    marked: &HashSet<usize>,
+    difftime_units: &HashMap<usize, String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (schema, combined) = read_combined(arrow_path)?;
+    let taken = take_rows(&combined, indices)?;
+    let nrows = taken.num_rows();
+    if nrows + 1 > EXCEL_MAX_ROWS {
+        return Err(format!(
+            "{} rows exceeds Excel's limit of {} (including the header); export as Arrow or CSV instead",
+            nrows, EXCEL_MAX_ROWS
+        )
+        .into());
+    }
+    let blank = export_blank_flags(schema.as_ref(), marked);
+    // Logicals stay boolean (Excel shows TRUE/FALSE); difftimes become real
+    // numbers in R's units; opaque columns are blanked.
+    let flat = flatten_for_export(&taken, &blank, difftime_units, ExportTarget::Xlsx)?;
+    let flat_schema = flat.schema();
+    let ncols = flat.num_columns();
+    let kinds: Vec<String> = flat_schema
+        .fields()
+        .iter()
+        .map(|f| type_label(f.data_type()))
+        .collect();
+    let opts = FormatOptions::default();
+    let formatters: Vec<Option<ArrayFormatter>> = (0..ncols)
+        .map(|c| {
+            if blank[c] {
+                Ok(None)
+            } else {
+                ArrayFormatter::try_new(flat.column(c).as_ref(), &opts).map(Some)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut workbook = Workbook::new();
+    let worksheet = workbook.add_worksheet();
+    for c in 0..ncols {
+        worksheet.write_string(0, c as u16, flat_schema.field(c).name().as_str())?;
+    }
+    for r in 0..nrows {
+        let row = (r + 1) as u32;
+        for c in 0..ncols {
+            if blank[c] {
+                continue;
+            }
+            let col = c as u16;
+            if flat.column(c).is_null(r) {
+                continue;
+            }
+            let f = match &formatters[c] {
+                Some(f) => f,
+                None => continue,
+            };
+            let value = f.value(r).to_string();
+            match kinds[c].as_str() {
+                "int" | "integer64" | "dbl" | "decimal" => match value.parse::<f64>() {
+                    Ok(x) => {
+                        worksheet.write_number(row, col, x)?;
+                    }
+                    Err(_) => {
+                        worksheet.write_string(row, col, value)?;
+                    }
+                },
+                "lgl" => {
+                    if value == "true" {
+                        worksheet.write_boolean(row, col, true)?;
+                    } else if value == "false" {
+                        worksheet.write_boolean(row, col, false)?;
+                    } else {
+                        worksheet.write_string(row, col, value)?;
+                    }
+                }
+                _ => {
+                    let text: String = if value.chars().count() > EXCEL_MAX_CELL_CHARS {
+                        value.chars().take(EXCEL_MAX_CELL_CHARS).collect()
+                    } else {
+                        value
+                    };
+                    worksheet.write_string(row, col, text)?;
+                }
+            }
+        }
+    }
+    workbook.save(dest)?;
     Ok(())
 }
 

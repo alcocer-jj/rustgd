@@ -27,6 +27,14 @@ view <- function(df, title = NULL) {
     )
   }
 
+  # Keep atomic list columns as real Arrow Lists; replace object list columns
+  # with per-cell placeholders so write_feather cannot choke on them. The
+  # returned indices mark the stringified columns for the descriptor.
+  prep <- .rustgd_frames_prepare(df)
+  df <- prep$df
+  list_cols <- prep$list_cols
+  difftime_units <- prep$difftime_units
+
   frames <- .rustgd_frames_dir()
   dir.create(frames, recursive = TRUE, showWarnings = FALSE)
   .rustgd_frames_register_cleanup()
@@ -57,6 +65,15 @@ view <- function(df, title = NULL) {
     paste0("title=", label),
     paste0("full_rows=", nrow(df))
   )
+  if (length(list_cols) > 0) {
+    lines <- c(lines, paste0("list_cols=", paste(list_cols, collapse = ",")))
+  }
+  if (length(difftime_units) > 0) {
+    lines <- c(
+      lines,
+      paste0("difftime_units=", paste(difftime_units, collapse = ","))
+    )
+  }
   descriptor <- file.path(frames, paste0(stem, ".txt"))
   tmp_desc <- paste0(descriptor, ".tmp")
   writeLines(lines, tmp_desc)
@@ -64,6 +81,61 @@ view <- function(df, title = NULL) {
 
   .rustgd_frames_ensure(frames)
   invisible(arrow_path)
+}
+
+#' Internal: prepare a data frame for the frames channel.
+#'
+#' Atomic list columns, where every element is a bare atomic vector or NULL (for
+#' example a list of integer vectors like row ids), are left untouched so
+#' write_feather stores them as a real Arrow List and they export losslessly.
+#' Object list columns, lists of models, plots, nested data frames, or anything
+#' else Arrow cannot represent, are replaced cell by cell with a
+#' "<class [length]>" placeholder string. That both stops write_feather from
+#' erroring on the column and gives the viewer a readable label. The returned
+#' `list_cols` holds the zero-based indices of the stringified columns, so the
+#' descriptor can tell the viewer to label them "list" and disable sort and
+#' filter on them. Real Arrow List columns need no marking; the viewer detects
+#' those from the Arrow schema directly.
+#' @noRd
+.rustgd_frames_prepare <- function(df) {
+  list_cols <- integer(0)
+  difftime_units <- character(0)
+  for (j in seq_along(df)) {
+    col <- df[[j]]
+    if (inherits(col, "difftime")) {
+      # Arrow stores a difftime as a duration in a fixed unit and drops R's
+      # units attribute, so record it here (zero-based index) for the viewer to
+      # show in the column header and to render the cells in.
+      u <- attr(col, "units")
+      if (is.null(u) || !nzchar(u)) {
+        u <- "secs"
+      }
+      difftime_units <- c(difftime_units, sprintf("%d:%s", j - 1L, u))
+      next
+    }
+    if (is.list(col) && !is.data.frame(col)) {
+      all_atomic <- all(vapply(
+        col,
+        function(e) is.null(e) || (is.atomic(e) && is.null(dim(e))),
+        logical(1)
+      ))
+      if (!all_atomic) {
+        df[[j]] <- vapply(
+          col,
+          function(e) {
+            if (is.null(e)) {
+              NA_character_
+            } else {
+              sprintf("<%s [%d]>", class(e)[1L], length(e))
+            }
+          },
+          character(1)
+        )
+        list_cols <- c(list_cols, j - 1L)
+      }
+    }
+  }
+  list(df = df, list_cols = list_cols, difftime_units = difftime_units)
 }
 
 #' Internal: per-process frames directory, a sibling of the plots and widgets

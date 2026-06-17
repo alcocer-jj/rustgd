@@ -38,7 +38,7 @@ required-features = ["frames"]
 
 [features]
 webview = ["dep:wry", "dep:tao"]
-frames = ["dep:arrow"]
+frames = ["dep:arrow", "dep:rust_xlsxwriter"]
 
 [dependencies]
 extendr-api = { version = "0.9.0", features = ["graphics"] }
@@ -52,7 +52,15 @@ ttf-parser = "0.25"
 rfd = "0.14"
 png = "0.17"
 base64 = "0.22"
-arrow = { version = "55", features = ["ipc", "csv"], optional = true }
+# chrono-tz lets the formatter render Timestamp columns carrying a named zone
+# (R POSIXct serialises as e.g. "UTC" or "America/Los_Angeles"); without it arrow
+# only handles offset zones and errors out, which aborts the whole frame load.
+arrow = { version = "55", features = ["ipc", "csv", "chrono-tz"], optional = true }
+# Excel export for the frames viewer, behind the `frames` feature like arrow so
+# the plain package install never compiles it. Needs Rust 1.73+ (your toolchain
+# is well past that); the package's declared rust-version is only a promise about
+# this crate and is not enforced against optional dependencies.
+rust_xlsxwriter = { version = "0.95", optional = true }
 
 
 # Webview stack, optional and only activated by the `webview` feature.
