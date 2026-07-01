@@ -214,10 +214,13 @@ rustgd_input_handler <- function() {
     # restores the counter to the latest plot so the next user-issued
     # plot() increments cleanly to a fresh page.
     rustgd_set_replay_mode(TRUE)
-    on.exit({
-      rustgd_set_replay_mode(FALSE)
-      rustgd_set_current_page(n_plots)
-    }, add = TRUE)
+    on.exit(
+      {
+        rustgd_set_replay_mode(FALSE)
+        rustgd_set_current_page(n_plots)
+      },
+      add = TRUE
+    )
 
     for (i in seq_len(n_plots)) {
       rustgd_set_current_page(i)
@@ -253,10 +256,13 @@ rustgd_input_handler <- function() {
         exprs <- plot_entry$exprs
         if (is.null(exprs)) next
         for (e in exprs) {
-          tryCatch({
-            out <- withVisible(eval(e, envir = globalenv()))
-            if (isTRUE(out$visible)) print(out$value)
-          }, error = function(err) NULL)
+          tryCatch(
+            {
+              out <- withVisible(eval(e, envir = globalenv()))
+              if (isTRUE(out$visible)) print(out$value)
+            },
+            error = function(err) NULL
+          )
         }
       }
     }
@@ -334,7 +340,9 @@ rustgd_task_callback <- function(expr) {
 #' at plot-0001.svg.
 rustgd_handle_clear_all <- function() {
   session_dir <- .rustgd_state$session_dir
-  if (is.null(session_dir)) return(invisible(NULL))
+  if (is.null(session_dir)) {
+    return(invisible(NULL))
+  }
 
   # Consume the signal first so we don't loop on it.
   try(file.remove(file.path(session_dir, "clear_all.txt")), silent = TRUE)
@@ -362,7 +370,9 @@ rustgd_handle_clear_all <- function() {
 #' indices.
 rustgd_handle_clear_plot <- function() {
   session_dir <- .rustgd_state$session_dir
-  if (is.null(session_dir)) return(invisible(NULL))
+  if (is.null(session_dir)) {
+    return(invisible(NULL))
+  }
   marker <- file.path(session_dir, "clear_plot.txt")
 
   content <- tryCatch(
@@ -376,10 +386,14 @@ rustgd_handle_clear_plot <- function() {
   }
 
   idx <- suppressWarnings(as.integer(content))
-  if (is.na(idx) || idx < 1) return(invisible(NULL))
+  if (is.na(idx) || idx < 1) {
+    return(invisible(NULL))
+  }
 
   n_plots <- length(.rustgd_state$plot_history)
-  if (idx > n_plots) return(invisible(NULL))
+  if (idx > n_plots) {
+    return(invisible(NULL))
+  }
 
   # Drop the entry from history.
   .rustgd_state$plot_history <- .rustgd_state$plot_history[-idx]
@@ -410,7 +424,8 @@ rustgd_handle_clear_plot <- function() {
 #'
 #' Activates the full rustgd suite in one call: the graphics device for
 #' plots, the web viewer for HTML widgets and Shiny apps (and explicit
-#' URLs via [rustgd_browse()]), and the data frame viewer behind `View()`.
+#' URLs via [rustgd_browse()]), and the data frame viewer behind `View()`
+#' and lowercase `view()` (including the `view()` that tibble exports).
 #' The change takes
 #' effect immediately in the current session, and a small snippet is also
 #' written to your user-level `.Rprofile` so the same setup is restored
@@ -425,8 +440,8 @@ rustgd_handle_clear_plot <- function() {
 #' "eager" additionally opens a plot window straight away, so it is ready
 #' before you plot anything.
 #'
-#' The web viewer and the `View()` route are turned on immediately in
-#' both modes. The `.Rprofile` snippet is guarded by `interactive()` so
+#' The web viewer and the `View()`/`view()` routes are turned on
+#' immediately in both modes. The `.Rprofile` snippet is guarded by `interactive()` so
 #' non-interactive contexts (Rscript, R CMD BATCH, knitr, testthat,
 #' package checks) are unaffected, and by `requireNamespace()` so
 #' uninstalling rustgd will not break R startup.
@@ -499,7 +514,7 @@ use_rustgd <- function(
 
   writeLines(new_contents, rprofile_path)
 
-  message("rustgd: active now (plots, web viewer, and View() data frames).")
+  message("rustgd: active now (plots, web viewer, and View()/view() data frames).")
   message(sprintf(
     "  Persisted to %s (mode: %s) for future sessions.",
     rprofile_path, mode
@@ -513,7 +528,7 @@ use_rustgd <- function(
 #'
 #' Inverse of [use_rustgd()]. Restores the previous graphics device, web
 #' viewer, and Shiny launcher in the current session, removes the rustgd
-#' `View()` route, and strips the auto-activation snippet from
+#' `View()` and `view()` routes, and strips the auto-activation snippet from
 #' `.Rprofile`. Any rustgd windows already open are left alone. Safe to
 #' call when nothing is active.
 #'
@@ -567,8 +582,9 @@ unuse_rustgd <- function(
 #' Activate the rustgd suite in the current session only.
 #'
 #' Routes plots to the rustgd graphics device, HTML widgets and Shiny
-#' apps to the rustgd web viewer, and `View()` to the rustgd data frame
-#' window, for this session only. Does not modify `.Rprofile`.
+#' apps to the rustgd web viewer, and `View()` and lowercase `view()` to
+#' the rustgd data frame window, for this session only. Does not modify
+#' `.Rprofile`.
 #' Used internally by [use_rustgd()] and by the `.Rprofile` snippet it
 #' writes; also usable directly for a one-off session.
 #'
@@ -595,7 +611,7 @@ rustgd_enable <- function(mode = c("lazy", "eager")) {
   # HTML widgets (options(viewer)) and Shiny apps (shiny.launch.browser).
   use_rustgd_webview()
 
-  # Data frames: send View() to the rustgd frames window.
+  # Data frames: send View() and view() to the rustgd frames window.
   .rustgd_mask_view()
 
   invisible(NULL)
@@ -604,8 +620,8 @@ rustgd_enable <- function(mode = c("lazy", "eager")) {
 #' Deactivate the rustgd suite in the current session only.
 #'
 #' Inverse of [rustgd_enable()]. Restores the previous graphics device,
-#' web viewer, and Shiny launcher, and removes the `View()` route, without
-#' touching `.Rprofile`. Open rustgd windows are left alone.
+#' web viewer, and Shiny launcher, and removes the `View()` and `view()`
+#' routes, without touching `.Rprofile`. Open rustgd windows are left alone.
 #'
 #' @export
 rustgd_disable <- function() {
@@ -639,19 +655,23 @@ rustgd_disable <- function() {
   }
 }
 
-# Internal: route View(df) to the rustgd frames window by binding `View`
-# in the global environment. The global environment is searched before any
-# attached package, so this wins over utils::View regardless of when utils
-# is attached. (A search-path attach() does not survive startup: when this
-# runs from .Rprofile only base is loaded, and utils attaches afterward
-# above the mask, so utils::View would win.) The wrapper deparses the
-# variable name at this boundary (View() is called by the user, so
-# substitute() sees their expression) and passes it through as the window
-# title; otherwise every window would be titled after the wrapper's own
-# argument. The binding is tagged so unmasking only ever removes our own
-# View and never a View the user defined themselves.
+# Internal: route View(df) and view(df) to the rustgd frames window by
+# binding both names in the global environment. The global environment is
+# searched before any attached package, so this wins over utils::View and
+# over tibble's view() regardless of when those packages attach. (A
+# search-path attach() does not survive startup: when this runs from
+# .Rprofile only base is loaded, and utils attaches afterward above the
+# mask, so utils::View would win.) One wrapper serves both names: it
+# deparses the variable name at this boundary (View()/view() is called by
+# the user, so substitute() sees their expression) and passes it through as
+# the window title; otherwise every window would be titled after the
+# wrapper's own argument. The `...` absorbs extra arguments other view()
+# implementations accept (such as tibble's `n`). The wrapper calls the
+# package's own `view` by lexical scope, not the global binding, so there
+# is no recursion. The binding is tagged so unmasking only ever removes our
+# own functions and never a View or view the user defined themselves.
 .rustgd_mask_view <- function() {
-  wrapper <- function(x, title = NULL) {
+  wrapper <- function(x, title = NULL, ...) {
     if (is.null(title)) {
       title <- deparse(substitute(x))[1]
     }
@@ -659,17 +679,20 @@ rustgd_disable <- function() {
   }
   attr(wrapper, "rustgd_view_mask") <- TRUE
   assign("View", wrapper, envir = globalenv())
+  assign("view", wrapper, envir = globalenv())
   invisible(NULL)
 }
 
-# Internal: remove our View() binding from the global environment, leaving
-# a user-defined View (one without our tag) untouched.
+# Internal: remove our View()/view() bindings from the global environment,
+# leaving a user-defined View or view (one without our tag) untouched.
 .rustgd_unmask_view <- function() {
   g <- globalenv()
-  if (exists("View", envir = g, inherits = FALSE)) {
-    cur <- get("View", envir = g, inherits = FALSE)
-    if (is.function(cur) && isTRUE(attr(cur, "rustgd_view_mask"))) {
-      rm("View", envir = g)
+  for (nm in c("View", "view")) {
+    if (exists(nm, envir = g, inherits = FALSE)) {
+      cur <- get(nm, envir = g, inherits = FALSE)
+      if (is.function(cur) && isTRUE(attr(cur, "rustgd_view_mask"))) {
+        rm(list = nm, envir = g)
+      }
     }
   }
   invisible(NULL)
@@ -681,11 +704,15 @@ rustgd_disable <- function() {
 # NULL if a start marker exists without a matching end marker.
 .rustgd_strip_snippet <- function(lines, start_marker, end_marker) {
   start_idx <- which(lines == start_marker)
-  if (length(start_idx) == 0) return(lines)
+  if (length(start_idx) == 0) {
+    return(lines)
+  }
 
   end_idx <- which(lines == end_marker)
   end_idx <- end_idx[end_idx > start_idx[1]]
-  if (length(end_idx) == 0) return(NULL)
+  if (length(end_idx) == 0) {
+    return(NULL)
+  }
 
   start_idx <- start_idx[1]
   end_idx <- end_idx[1]

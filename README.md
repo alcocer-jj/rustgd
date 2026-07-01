@@ -32,7 +32,9 @@ rustgd registers a real R graphics device. Every `plot()`, `hist()`, base-graphi
 
 ![mtcars in the rustgd frames window](man/figures/frames.gif)
 
-`View(df)` opens a fast, scrollable table. Columns sort, resize, and filter, with a level checklist for factors, a contains box for text, and a min and max range for numeric columns; the row count updates as filters narrow the data. A Summary panel reports per-column statistics such as missing count, unique count, and a type-appropriate breakdown over what is currently shown. Every frame you view stays loaded, so paging back to an earlier one restores its sort, selection, and scroll position. The current view, filtered and in its current order, exports to Arrow or CSV.
+`View(df)` opens a fast, scrollable table. Columns sort, resize, and filter, with a level checklist for factors, a contains box for text, and a min and max range for numeric columns; the row count updates as filters narrow the data. A Summary panel reports per-column statistics such as missing count, unique count, and a type-appropriate breakdown over what is currently shown. Every frame you view stays loaded, so paging back to an earlier one restores its sort, selection, and scroll position. The current view, filtered and in its current order, exports to Arrow, CSV, or Excel.
+
+Both capitalized `View()` and lowercase `view()` open this window, including the `view()` that tibble exports, so the table appears whichever one you reach for. Cells are shown the way R stores them rather than the way Arrow happens to format them, so a value read off the table can be pasted straight into a filter: logicals read `TRUE`/`FALSE`, and a difftime reads as its plain numeric value in the column's own units (with the unit in the header). The CSV and Excel exports follow the same rule. `unuse_rustgd()` puts the original `View()` and `view()` back.
 
 ### HTML and web content
 
@@ -48,7 +50,7 @@ For anything that already lives at a live address, a Shiny app, a local dashboar
 
 Under the hood rustgd is an R package with a Rust core built using extendr. The plot device is a true R graphics device compiled into the package; it serializes each page to SVG and hands it to a separate viewer process through a per-session temporary directory. That same directory is how the window signals resizes back to R, which is what lets the device replay a plot at the new size instead of scaling a bitmap.
 
-The data frame and web viewers are two more small native binaries. `View()` is rewired to write your data as Apache Arrow and feed the table window, and R's `viewer` and `shiny.launch.browser` options are pointed at the web binary so widgets and apps route there automatically. All three binaries are compiled when the package builds and shipped inside it, so there is nothing extra to download or launch at runtime. The windows open lazily, the first time you actually draw a plot, view a frame, or show a widget.
+The data frame and web viewers are two more small native binaries. Both `View()` and the lowercase `view()` (the latter also exported by tibble) are rewired to write your data as Apache Arrow and feed the table window, and R's `viewer` and `shiny.launch.browser` options are pointed at the web binary so widgets and apps route there automatically. All three binaries are compiled when the package builds and shipped inside it, so there is nothing extra to download or launch at runtime. The windows open lazily, the first time you actually draw a plot, view a frame, or show a widget.
 
 ## Installation
 
@@ -90,7 +92,7 @@ Turn everything back off and restore R's defaults:
 unuse_rustgd()
 ```
 
-`use_rustgd()` activates the viewers now and writes a small snippet to your `~/.Rprofile` so new sessions start with rustgd already on. `unuse_rustgd()` removes that snippet and restores the normal graphics device, `View()`, and HTML viewer. The snippet only runs in interactive sessions, so `Rscript`, R CMD BATCH, knitr, and package checks are left alone.
+`use_rustgd()` activates the viewers now and writes a small snippet to your `~/.Rprofile` so new sessions start with rustgd already on. `unuse_rustgd()` removes that snippet and restores the normal graphics device, the original `View()` and `view()`, and HTML viewer. The snippet only runs in interactive sessions, so `Rscript`, R CMD BATCH, knitr, and package checks are left alone.
 
 `use_rustgd()` takes a `mode` argument that affects only the plot window. The default, `"lazy"`, registers the device so the window opens the first time you draw a plot, the same way base R's `quartz` and `X11` behave. Pass `"eager"` to open a plot window straight away, before you plot anything:
 
@@ -98,7 +100,7 @@ unuse_rustgd()
 use_rustgd(mode = "eager")
 ```
 
-The web viewer and the `View()` route turn on immediately in either mode.
+The web viewer and the `View()` and `view()` routes turn on immediately in either mode.
 
 To switch the viewers on or off for the current session only, without touching `.Rprofile`:
 
