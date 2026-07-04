@@ -8,6 +8,6 @@ rustgd_disable()
 }
 \description{
 Inverse of \code{\link[=rustgd_enable]{rustgd_enable()}}. Restores the previous graphics device,
-web viewer, and Shiny launcher, and removes the \code{View()} route, without
-touching \code{.Rprofile}. Open rustgd windows are left alone.
+web viewer, and Shiny launcher, and removes the \code{View()} and \code{view()}
+routes, without touching \code{.Rprofile}. Open rustgd windows are left alone.
 }

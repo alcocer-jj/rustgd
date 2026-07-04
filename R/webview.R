@@ -130,7 +130,7 @@ rustgd_shiny_launch <- function(url, ...) {
 #' the widget's bundle (its `index.html` and `lib/`) into the widget directory
 #' as `widget-NNNN/`, writes a `widget-NNNN.txt` descriptor next to it, and
 #' makes sure a webview window is running. A URL is handed to
-#' [.rustgd_push_url()] and shown in place.
+#' `.rustgd_push_url()` and shown in place.
 #' @noRd
 rustgd_view <- function(url, height = NULL, ...) {
   tryCatch(

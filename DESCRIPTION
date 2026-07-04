@@ -1,6 +1,6 @@
 Package: rustgd
 Title: Rust-Backed Graphics Device and Viewer Windows for Terminal R Sessions
-Version: 0.0.0.9003
+Version: 0.1.0
 Authors@R: 
     person("Jose J.", "Alcocer", email = "alcocer@protonmail.com", role = c("aut", "cre"))
 Description: Provides a Rust-backed graphics device and companion viewer
@@ -8,12 +8,16 @@ Description: Provides a Rust-backed graphics device and companion viewer
     terminal and editor R sessions without an IDE viewer pane (such as
     radian, Zed, or Neovim) can display graphics, htmlwidgets, Shiny apps,
     and data frames in native windows.
-License: MIT
+License: MIT + file LICENSE
 Encoding: UTF-8
 Roxygen: list(markdown = TRUE)
 RoxygenNote: 7.3.3
 Config/rextendr/version: 0.5.0
-SystemRequirements: Cargo (Rust's package manager), rustc
+SystemRequirements: Cargo (Rust's package manager) and rustc to compile the
+    bundled Rust sources. On Linux, the WebKit2GTK development files (e.g.
+    'libwebkit2gtk-4.1-dev') are required by the web viewer, and the standard
+    X11 and OpenGL development files (e.g. 'libxkbcommon-dev',
+    'libgl1-mesa-dev') by the plot and data-frame viewers.
 Depends: 
     R (>= 4.2)
 Imports:

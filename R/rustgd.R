@@ -422,16 +422,21 @@ rustgd_handle_clear_plot <- function() {
 
 #' Use rustgd for plots, web content, and data frames.
 #'
-#' Activates the full rustgd suite in one call: the graphics device for
-#' plots, the web viewer for HTML widgets and Shiny apps (and explicit
-#' URLs via [rustgd_browse()]), and the data frame viewer behind `View()`
-#' and lowercase `view()` (including the `view()` that tibble exports).
-#' The change takes
-#' effect immediately in the current session, and a small snippet is also
-#' written to your user-level `.Rprofile` so the same setup is restored
-#' automatically in future sessions.
+#' Activates the full rustgd suite for the current session: the graphics
+#' device for plots, the web viewer for HTML widgets and Shiny apps (and
+#' explicit URLs via [rustgd_browse()]). The data-frame viewer behind
+#' `View()` and lowercase `view()` is always available once the package is
+#' attached with `library(rustgd)`, so it does not require this call.
 #'
-#' Two startup modes control only the plot device:
+#' To make the plot and web viewer activation persist across sessions,
+#' this function can add a small snippet to your user-level `.Rprofile`.
+#' Because that edits a file in your home directory, it is only done in an
+#' interactive session and only after you explicitly confirm at a prompt.
+#' If you decline, or if the session is non-interactive (Rscript, R CMD
+#' BATCH, knitr, testthat, package checks), nothing is written and the
+#' snippet is printed for you to add yourself.
+#'
+#' Two startup modes control the plot device:
 #'
 #' "lazy" (the default) registers rustgd as the default device via
 #' `options(device = ...)`. The viewer window opens when you draw your
@@ -440,23 +445,17 @@ rustgd_handle_clear_plot <- function() {
 #' "eager" additionally opens a plot window straight away, so it is ready
 #' before you plot anything.
 #'
-#' The web viewer and the `View()`/`view()` routes are turned on
-#' immediately in both modes. The `.Rprofile` snippet is guarded by `interactive()` so
-#' non-interactive contexts (Rscript, R CMD BATCH, knitr, testthat,
-#' package checks) are unaffected, and by `requireNamespace()` so
-#' uninstalling rustgd will not break R startup.
-#'
-#' Safe to call repeatedly. Re-running with a different `mode` replaces
-#' the existing snippet in place.
-#'
 #' @param mode Either "lazy" or "eager"; see description. Affects the
 #'   plot device only.
 #' @param rprofile_path Path to the `.Rprofile` to modify. Defaults to
 #'   `~/.Rprofile`. Pass an explicit path to target a project-local
 #'   profile instead.
 #'
+#' @return Invisibly, the `.Rprofile` path if it was written, otherwise
+#'   `FALSE`.
+#'
 #' @seealso [unuse_rustgd()] to undo this, and [rustgd_enable()] for a
-#'   one-session activation that does not touch `.Rprofile`.
+#'   one-session activation that never touches `.Rprofile`.
 #'
 #' @export
 use_rustgd <- function(
@@ -468,7 +467,7 @@ use_rustgd <- function(
   # Apply to the running session right away.
   rustgd_enable(mode)
 
-  # Persist for future sessions via a marked .Rprofile snippet.
+  # The snippet that reproduces this activation at interactive startup.
   start_marker <- "# >>> rustgd auto-activate >>>"
   end_marker <- "# <<< rustgd auto-activate <<<"
 
@@ -483,6 +482,31 @@ use_rustgd <- function(
     "}",
     end_marker
   )
+
+  message("rustgd: active for this session (plots, web viewer, and View()/view()).")
+
+  # Persisting means editing the user's .Rprofile. Never do that during a
+  # non-interactive run (R CMD check, Rscript, knitr); just show the lines.
+  if (!interactive()) {
+    message("  To make this permanent, add these lines to ", rprofile_path, ":")
+    message(paste0("    ", snippet, collapse = "\n"))
+    return(invisible(FALSE))
+  }
+
+  # Interactive: write only after explicit, affirmative confirmation.
+  consent <- tryCatch(
+    isTRUE(utils::askYesNo(
+      sprintf("Write a rustgd auto-activation snippet to %s?", rprofile_path),
+      default = FALSE
+    )),
+    error = function(e) FALSE
+  )
+
+  if (!consent) {
+    message("  Left ", rprofile_path, " untouched. To persist it yourself, add:")
+    message(paste0("    ", snippet, collapse = "\n"))
+    return(invisible(FALSE))
+  }
 
   existing <- if (file.exists(rprofile_path)) {
     readLines(rprofile_path, warn = FALSE)
@@ -513,14 +537,8 @@ use_rustgd <- function(
   }
 
   writeLines(new_contents, rprofile_path)
-
-  message("rustgd: active now (plots, web viewer, and View()/view() data frames).")
-  message(sprintf(
-    "  Persisted to %s (mode: %s) for future sessions.",
-    rprofile_path, mode
-  ))
+  message(sprintf("  Persisted to %s (mode: %s).", rprofile_path, mode))
   message("  To undo everywhere: rustgd::unuse_rustgd()")
-
   invisible(rprofile_path)
 }
 
@@ -569,6 +587,27 @@ unuse_rustgd <- function(
     return(invisible(TRUE))
   }
 
+  # Removing the snippet edits the user's .Rprofile, so, like use_rustgd(),
+  # only do it interactively and only with explicit confirmation.
+  if (!interactive()) {
+    message("rustgd: deactivated in this session. A snippet remains in ", rprofile_path, ";")
+    message("  delete the block between the rustgd markers to disable it at startup.")
+    return(invisible(FALSE))
+  }
+
+  consent <- tryCatch(
+    isTRUE(utils::askYesNo(
+      sprintf("Remove the rustgd auto-activation snippet from %s?", rprofile_path),
+      default = FALSE
+    )),
+    error = function(e) FALSE
+  )
+
+  if (!consent) {
+    message("rustgd: deactivated in this session; left ", rprofile_path, " untouched.")
+    return(invisible(FALSE))
+  }
+
   # Trim any trailing blank lines that may now be exposed.
   while (length(stripped) > 0 && stripped[length(stripped)] == "") {
     stripped <- stripped[-length(stripped)]
@@ -609,10 +648,8 @@ rustgd_enable <- function(mode = c("lazy", "eager")) {
   }
 
   # HTML widgets (options(viewer)) and Shiny apps (shiny.launch.browser).
+  # View()/view() are ordinary package exports and need no activation here.
   use_rustgd_webview()
-
-  # Data frames: send View() and view() to the rustgd frames window.
-  .rustgd_mask_view()
 
   invisible(NULL)
 }
@@ -636,9 +673,6 @@ rustgd_disable <- function() {
   # Web viewer and Shiny launcher.
   unuse_rustgd_webview()
 
-  # Data frames.
-  .rustgd_unmask_view()
-
   invisible(NULL)
 }
 
@@ -655,47 +689,13 @@ rustgd_disable <- function() {
   }
 }
 
-# Internal: route View(df) and view(df) to the rustgd frames window by
-# binding both names in the global environment. The global environment is
-# searched before any attached package, so this wins over utils::View and
-# over tibble's view() regardless of when those packages attach. (A
-# search-path attach() does not survive startup: when this runs from
-# .Rprofile only base is loaded, and utils attaches afterward above the
-# mask, so utils::View would win.) One wrapper serves both names: it
-# deparses the variable name at this boundary (View()/view() is called by
-# the user, so substitute() sees their expression) and passes it through as
-# the window title; otherwise every window would be titled after the
-# wrapper's own argument. The `...` absorbs extra arguments other view()
-# implementations accept (such as tibble's `n`). The wrapper calls the
-# package's own `view` by lexical scope, not the global binding, so there
-# is no recursion. The binding is tagged so unmasking only ever removes our
-# own functions and never a View or view the user defined themselves.
-.rustgd_mask_view <- function() {
-  wrapper <- function(x, title = NULL, ...) {
-    if (is.null(title)) {
-      title <- deparse(substitute(x))[1]
-    }
-    view(x, title = title)
+#' @rdname view
+#' @export
+View <- function(df, title = NULL) {
+  if (is.null(title)) {
+    title <- deparse(substitute(df))[1]
   }
-  attr(wrapper, "rustgd_view_mask") <- TRUE
-  assign("View", wrapper, envir = globalenv())
-  assign("view", wrapper, envir = globalenv())
-  invisible(NULL)
-}
-
-# Internal: remove our View()/view() bindings from the global environment,
-# leaving a user-defined View or view (one without our tag) untouched.
-.rustgd_unmask_view <- function() {
-  g <- globalenv()
-  for (nm in c("View", "view")) {
-    if (exists(nm, envir = g, inherits = FALSE)) {
-      cur <- get(nm, envir = g, inherits = FALSE)
-      if (is.function(cur) && isTRUE(attr(cur, "rustgd_view_mask"))) {
-        rm(list = nm, envir = g)
-      }
-    }
-  }
-  invisible(NULL)
+  view(df, title = title)
 }
 
 # Internal helper. Removes a single rustgd snippet block (including
@@ -723,4 +723,20 @@ rustgd_disable <- function() {
   }
 
   lines[-(strip_start:end_idx)]
+}
+
+
+# Shown when the package is attached with library(rustgd). Concise and
+# once per session; suppressPackageStartupMessages() silences it. NOTE: if
+# the package gains an .onAttach elsewhere (e.g. R/zzz.R), merge this body
+# into that one rather than declaring a second .onAttach.
+.onAttach <- function(libname, pkgname) {
+  packageStartupMessage(
+    "rustgd: View() and view() now open data frames in a rustgd window.\n",
+    "  For plots and the web viewer this session, run rustgd::rustgd_enable().\n",
+    "  To make that automatic, add to your ~/.Rprofile:\n",
+    "    if (interactive() && requireNamespace(\"rustgd\", quietly = TRUE)) rustgd::rustgd_enable()\n",
+    "  or run rustgd::use_rustgd() to be prompted to write it for you.\n",
+    "  Silence this with suppressPackageStartupMessages(library(rustgd))."
+  )
 }

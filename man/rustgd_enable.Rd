@@ -12,8 +12,9 @@ rustgd_enable(mode = c("lazy", "eager"))
 }
 \description{
 Routes plots to the rustgd graphics device, HTML widgets and Shiny
-apps to the rustgd web viewer, and \code{View()} to the rustgd data frame
-window, for this session only. Does not modify \code{.Rprofile}.
+apps to the rustgd web viewer, and \code{View()} and lowercase \code{view()} to
+the rustgd data frame window, for this session only. Does not modify
+\code{.Rprofile}.
 Used internally by \code{\link[=use_rustgd]{use_rustgd()}} and by the \code{.Rprofile} snippet it
 writes; also usable directly for a one-off session.
 }

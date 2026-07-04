@@ -6,6 +6,14 @@
 #' viewers behave. Each call adds a frame; later stages page through them as a
 #' gallery.
 #'
+#' The capitalized `View()` is an identical alias. Both are ordinary exports,
+#' so they take effect as soon as the package is attached with
+#' `library(rustgd)`, needing no separate activation call. Once attached,
+#' `View()` shadows [utils::View()] for the session (utils is a base package,
+#' so an attached rustgd sits above it on the search path). Lowercase `view()`
+#' can be overtaken if a package that also exports `view()` (such as tibble) is
+#' attached after rustgd; re-run `library(rustgd)` or call `rustgd::view()`.
+#'
 #' The frame is written uncompressed so the viewer needs no compression codec.
 #' Requires the `arrow` package for `write_feather()`.
 #'
@@ -159,7 +167,7 @@ view <- function(df, title = NULL) {
 
 #' Internal: launch the frames binary for this directory if it is not already
 #' the one we have running. Liveness is decided up front in `view()` via
-#' [.rustgd_frames_alive()], which clears `.rustgd_state$frames_dir` when the
+#' `.rustgd_frames_alive()`, which clears `.rustgd_state$frames_dir` when the
 #' window is gone, so here we simply launch whenever it is not our active
 #' directory.
 #' @noRd

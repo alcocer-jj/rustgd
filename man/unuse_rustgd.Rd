@@ -13,7 +13,7 @@ unuse_rustgd(rprofile_path = path.expand("~/.Rprofile"))
 \description{
 Inverse of \code{\link[=use_rustgd]{use_rustgd()}}. Restores the previous graphics device, web
 viewer, and Shiny launcher in the current session, removes the rustgd
-\code{View()} route, and strips the auto-activation snippet from
+\code{View()} and \code{view()} routes, and strips the auto-activation snippet from
 \code{.Rprofile}. Any rustgd windows already open are left alone. Safe to
 call when nothing is active.
 }

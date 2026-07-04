@@ -42,7 +42,15 @@ frames = ["dep:arrow", "dep:rust_xlsxwriter"]
 
 [dependencies]
 extendr-api = { version = "0.9.0", features = ["graphics"] }
-eframe = "0.29"
+# eframe pinned to the glow (OpenGL) renderer only. Its defaults pull in the
+# entire wgpu stack (wgpu, wgpu-core, wgpu-hal, naga, ash, spirv, metal), which
+# dominates the vendored crate tarball; dropping default-features and selecting
+# glow removes all of it. default_fonts keeps egui's bundled fonts; x11 and
+# wayland keep Linux windowing (both are needed for the Linux CRAN target).
+# accesskit and web_screen_reader are intentionally omitted. Smoothness on
+# macOS is unaffected: glow still goes through winit, which drives the display
+# link correctly (unlike miniquad), so ProMotion stays ramped up.
+eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 egui = "0.29"
 # notify is declared per-platform below; its backend differs by OS.
 resvg = "0.43"

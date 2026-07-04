@@ -17,17 +17,27 @@ plot device only.}
 \verb{~/.Rprofile}. Pass an explicit path to target a project-local
 profile instead.}
 }
+\value{
+Invisibly, the \code{.Rprofile} path if it was written, otherwise
+\code{FALSE}.
+}
 \description{
-Activates the full rustgd suite in one call: the graphics device for
-plots, the web viewer for HTML widgets and Shiny apps (and explicit
-URLs via \code{\link[=rustgd_browse]{rustgd_browse()}}), and the data frame viewer behind \code{View()}.
-The change takes
-effect immediately in the current session, and a small snippet is also
-written to your user-level \code{.Rprofile} so the same setup is restored
-automatically in future sessions.
+Activates the full rustgd suite for the current session: the graphics
+device for plots, the web viewer for HTML widgets and Shiny apps (and
+explicit URLs via \code{\link[=rustgd_browse]{rustgd_browse()}}). The data-frame viewer behind
+\code{View()} and lowercase \code{view()} is always available once the package is
+attached with \code{library(rustgd)}, so it does not require this call.
 }
 \details{
-Two startup modes control only the plot device:
+To make the plot and web viewer activation persist across sessions,
+this function can add a small snippet to your user-level \code{.Rprofile}.
+Because that edits a file in your home directory, it is only done in an
+interactive session and only after you explicitly confirm at a prompt.
+If you decline, or if the session is non-interactive (Rscript, R CMD
+BATCH, knitr, testthat, package checks), nothing is written and the
+snippet is printed for you to add yourself.
+
+Two startup modes control the plot device:
 
 "lazy" (the default) registers rustgd as the default device via
 \code{options(device = ...)}. The viewer window opens when you draw your
@@ -35,17 +45,8 @@ first plot and not before, matching base R's \code{quartz} and \code{X11}.
 
 "eager" additionally opens a plot window straight away, so it is ready
 before you plot anything.
-
-The web viewer and the \code{View()} route are turned on immediately in
-both modes. The \code{.Rprofile} snippet is guarded by \code{interactive()} so
-non-interactive contexts (Rscript, R CMD BATCH, knitr, testthat,
-package checks) are unaffected, and by \code{requireNamespace()} so
-uninstalling rustgd will not break R startup.
-
-Safe to call repeatedly. Re-running with a different \code{mode} replaces
-the existing snippet in place.
 }
 \seealso{
 \code{\link[=unuse_rustgd]{unuse_rustgd()}} to undo this, and \code{\link[=rustgd_enable]{rustgd_enable()}} for a
-one-session activation that does not touch \code{.Rprofile}.
+one-session activation that never touches \code{.Rprofile}.
 }
