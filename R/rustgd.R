@@ -428,9 +428,11 @@ rustgd_handle_clear_plot <- function() {
 #' `View()` and lowercase `view()` is always available once the package is
 #' attached with `library(rustgd)`, so it does not require this call.
 #'
-#' To make the plot and web viewer activation persist across sessions,
-#' this function can add a small snippet to your user-level `.Rprofile`.
-#' Because that edits a file in your home directory, it is only done in an
+#' To make activation persist across sessions, this function can add a
+#' small snippet to your user-level `.Rprofile`. The snippet attaches the
+#' package (so `View()` and `view()` come with it) and turns on the plot
+#' device and web viewer, restoring the full suite at startup. Because
+#' that edits a file in your home directory, it is only done in an
 #' interactive session and only after you explicitly confirm at a prompt.
 #' If you decline, or if the session is non-interactive (Rscript, R CMD
 #' BATCH, knitr, testthat, package checks), nothing is written and the
@@ -475,8 +477,10 @@ use_rustgd <- function(
     start_marker,
     paste0("# mode: ", mode),
     "if (interactive() && requireNamespace(\"rustgd\", quietly = TRUE)) {",
-    "  tryCatch(",
-    paste0("    rustgd::rustgd_enable(\"", mode, "\"),"),
+    "  tryCatch({",
+    "    suppressPackageStartupMessages(library(rustgd))",
+    paste0("    rustgd::rustgd_enable(\"", mode, "\")"),
+    "  },",
     "    error = function(e) message(\"rustgd: auto-activation failed: \", conditionMessage(e))",
     "  )",
     "}",
