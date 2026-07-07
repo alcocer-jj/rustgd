@@ -95,10 +95,12 @@ rustgd_enable()
 rustgd_disable()
 ```
 
-To also carry the plot and web viewers into future sessions automatically, use
-`use_rustgd()`. It turns them on now and *offers* to add a one-line activation
-snippet to your `~/.Rprofile`; it asks first and writes only if you confirm, so
-nothing touches your startup file without your say-so:
+To carry all three viewers into future sessions automatically, use
+`use_rustgd()`. It turns on the plot device and web viewer now and *offers* to
+add a one-line activation snippet to your `~/.Rprofile`; the snippet attaches the
+package (so `View()` and `view()` come with it) and enables the plot and web
+viewers, restoring the full suite at startup. It asks first and writes only if
+you confirm, so nothing touches your startup file without your say-so:
 
 ```r
 use_rustgd()
