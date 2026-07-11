@@ -1,4 +1,3 @@
-
 # R session / project files
 .Rproj.user
 .Rhistory
@@ -16,6 +15,11 @@
 
 # Rust build tree (large; recompiled at install)
 src/rust/target/
+
+# Vendored crate sources, unpacked from vendor.tar.xz by the offline build.
+# The tarball itself is committed; this extracted tree must never be.
+src/vendor/
+src/rust/vendor/
 
 # Makevars generated from *.in by configure at install
 src/Makevars
