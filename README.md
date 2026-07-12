@@ -140,4 +140,4 @@ rustgd_browse("http://127.0.0.1:4321")
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE.md).
