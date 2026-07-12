@@ -1,7 +1,9 @@
 # rustgd
 
 <!-- badges: start -->
-[![R-universe](https://alcocer-jj.r-universe.dev/badges/rustgd)](https://alcocer-jj.r-universe.dev/rustgd)
+[![registry status badge](https://alcocer-jj.r-universe.dev/badges/:registry)](https://alcocer-jj.r-universe.dev/)
+[![R-universe](https://img.shields.io/badge/dynamic/json?url=https://alcocer-jj.r-universe.dev/api/packages/rustgd&query=$.Version&label=R-universe&color=blue)](https://alcocer-jj.r-universe.dev/rustgd)
+[![rustgd](https://img.shields.io/badge/License-MIT-orange)](https://alcocer-jj.r-universe.dev/rustgd)
 <!-- badges: end -->
 
 Native plot, data frame, and HTML viewer windows for R sessions that live in a terminal or a lean editor.
