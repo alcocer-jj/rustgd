@@ -1560,12 +1560,12 @@ impl RustdfApp {
         let text_white = v.text_color();
         let accent = v.text_color();
         let dots_hover_color = v.strong_text_color();
-        let grid_stroke = egui::Stroke::new(1.0, v.widgets.noninteractive.bg_stroke.color);
+        let grid_stroke = egui::Stroke::new(1.0_f32, v.widgets.noninteractive.bg_stroke.color);
         // Selection keeps rustdf's Positron-style navy rather than egui's stock
         // selection blue. The fill is translucent so the row underneath shows
         // through; the border is solid. Navy reads on both light and dark rows.
         let sel_fill = egui::Color32::from_rgba_unmultiplied(0x2C, 0x4B, 0x77, 64);
-        let sel_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(0x2C, 0x4B, 0x77));
+        let sel_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x2C, 0x4B, 0x77));
 
         let id = self.id;
         let headers = &self.headers;
