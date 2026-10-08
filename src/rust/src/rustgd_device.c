@@ -50,28 +50,34 @@ extern void rustgd_cb_mode(void *dev, int mode);
 
 extern void rustgd_cb_line(void *dev,
                            double x1, double y1, double x2, double y2,
-                           int col, double lwd, int lty);
+                           int col, double lwd, int lty,
+                           int lend, int ljoin, double lmitre);
 
 extern void rustgd_cb_polyline(void *dev,
                                int n, const double *x, const double *y,
-                               int col, double lwd, int lty);
+                               int col, double lwd, int lty,
+                               int lend, int ljoin, double lmitre);
 
 extern void rustgd_cb_rect(void *dev,
                            double x0, double y0, double x1, double y1,
-                           int col, int fill, double lwd, int lty);
+                           int col, int fill, double lwd, int lty,
+                           int lend, int ljoin, double lmitre);
 
 extern void rustgd_cb_polygon(void *dev,
                               int n, const double *x, const double *y,
-                              int col, int fill, double lwd, int lty);
+                              int col, int fill, double lwd, int lty,
+                              int lend, int ljoin, double lmitre);
 
 extern void rustgd_cb_circle(void *dev,
                              double x, double y, double r,
-                             int col, int fill, double lwd, int lty);
+                             int col, int fill, double lwd, int lty,
+                             int lend, int ljoin, double lmitre);
 
 extern void rustgd_cb_path(void *dev,
                            const double *x, const double *y,
                            int npoly, const int *nper, int winding,
-                           int col, int fill, double lwd, int lty);
+                           int col, int fill, double lwd, int lty,
+                           int lend, int ljoin, double lmitre);
 
 extern void rustgd_cb_raster(void *dev,
                              const unsigned int *raster, int w, int h,
@@ -105,9 +111,11 @@ extern void rustgd_cb_clip(void *dev,
 // ----------------------------------------------------------------------
 //
 // Each wrapper unmarshals the R_GE_gcontext fields we care about and
-// forwards to Rust. None of these wrappers retain pointers across
-// calls; strings and arrays are valid only for the duration of the
-// Rust call. None of them allocate or own anything.
+// forwards to Rust. Stroked primitives pass the full stroke description
+// (col, lwd, lty, lend, ljoin, lmitre) so the SVG can match R's own
+// devices. None of these wrappers retain pointers across calls.
+// Strings and arrays are valid only for the duration of the Rust call.
+// None of them allocate or own anything.
 
 static void rg_activate(pDevDesc dd) {
     rustgd_cb_activate(dd->deviceSpecific);
@@ -149,38 +157,44 @@ static void rg_mode(int mode, pDevDesc dd) {
 static void rg_line(double x1, double y1, double x2, double y2,
                     const pGEcontext gc, pDevDesc dd) {
     rustgd_cb_line(dd->deviceSpecific, x1, y1, x2, y2,
-                   gc->col, gc->lwd, gc->lty);
+                   gc->col, gc->lwd, gc->lty,
+                   gc->lend, gc->ljoin, gc->lmitre);
 }
 
 static void rg_polyline(int n, double *x, double *y,
                         const pGEcontext gc, pDevDesc dd) {
     rustgd_cb_polyline(dd->deviceSpecific, n, x, y,
-                       gc->col, gc->lwd, gc->lty);
+                       gc->col, gc->lwd, gc->lty,
+                       gc->lend, gc->ljoin, gc->lmitre);
 }
 
 static void rg_rect(double x0, double y0, double x1, double y1,
                     const pGEcontext gc, pDevDesc dd) {
     rustgd_cb_rect(dd->deviceSpecific, x0, y0, x1, y1,
-                   gc->col, gc->fill, gc->lwd, gc->lty);
+                   gc->col, gc->fill, gc->lwd, gc->lty,
+                   gc->lend, gc->ljoin, gc->lmitre);
 }
 
 static void rg_polygon(int n, double *x, double *y,
                        const pGEcontext gc, pDevDesc dd) {
     rustgd_cb_polygon(dd->deviceSpecific, n, x, y,
-                      gc->col, gc->fill, gc->lwd, gc->lty);
+                      gc->col, gc->fill, gc->lwd, gc->lty,
+                      gc->lend, gc->ljoin, gc->lmitre);
 }
 
 static void rg_circle(double x, double y, double r,
                       const pGEcontext gc, pDevDesc dd) {
     rustgd_cb_circle(dd->deviceSpecific, x, y, r,
-                     gc->col, gc->fill, gc->lwd, gc->lty);
+                     gc->col, gc->fill, gc->lwd, gc->lty,
+                     gc->lend, gc->ljoin, gc->lmitre);
 }
 
 static void rg_path(double *x, double *y, int npoly, int *nper,
                     Rboolean winding,
                     const pGEcontext gc, pDevDesc dd) {
     rustgd_cb_path(dd->deviceSpecific, x, y, npoly, nper, winding ? 1 : 0,
-                   gc->col, gc->fill, gc->lwd, gc->lty);
+                   gc->col, gc->fill, gc->lwd, gc->lty,
+                   gc->lend, gc->ljoin, gc->lmitre);
 }
 
 static void rg_raster(unsigned int *raster, int w, int h,
