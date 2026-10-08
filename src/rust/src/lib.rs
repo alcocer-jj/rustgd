@@ -1059,7 +1059,16 @@ impl RustgdDevice {
         fontface: i32,
         fontfamily: &str,
     ) -> (f64, f64, f64) {
-        let ch = match char::from_u32(c as u32) {
+        // R encodes the character in c with two conventions, the same ones
+        // R's own cairo device (Cairo_MetricInfo) honors. A negative c means
+        // Unicode code point -c, and in a UTF-8 locale plotmath sends every
+        // character this way, including spaces and the Greek letters of the
+        // symbol font. A c of 0 asks for the metrics of 'M'. Reading c as a
+        // plain u32 turned every negative code into an invalid char, which
+        // collapsed plotmath glyph widths to zero and stacked them on top of
+        // each other.
+        let code = if c == 0 { 77 } else { c.unsigned_abs() };
+        let ch = match char::from_u32(code) {
             Some(ch) => ch,
             None => return (0.0, 0.0, 0.0),
         };
