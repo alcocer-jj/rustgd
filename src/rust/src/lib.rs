@@ -184,6 +184,38 @@ fn r_color_to_svg(color: i32) -> String {
     }
 }
 
+/// Translate R's packed line type into an SVG stroke-dasharray attribute.
+///
+/// R stores a dash pattern in gc->lty as up to eight 4-bit nibbles, read
+/// from the least significant end. Each nibble is a segment length in
+/// multiples of the line width, alternating on and off. LTY_SOLID is 0 and
+/// LTY_BLANK is -1, and neither carries a pattern. Segment lengths scale by
+/// lwd with a floor of 1, which matches R's own cairo and svglite devices,
+/// so thin dotted lines keep visible gaps. The device draws at 96 px per
+/// inch and R's lwd unit is 1/96 inch, so lwd maps straight to pixels.
+/// The returned string is empty for solid lines, so callers can splice it
+/// into an element unconditionally.
+fn lty_to_dasharray(lty: i32, lwd: f64) -> String {
+    if lty == 0 || lty == -1 {
+        return String::new();
+    }
+    let unit = if lwd > 1.0 { lwd } else { 1.0 };
+    let mut bits = lty as u32;
+    let mut parts: Vec<String> = Vec::with_capacity(8);
+    for _ in 0..8 {
+        let seg = bits & 0xF;
+        if seg == 0 {
+            break;
+        }
+        parts.push(format!("{:.3}", seg as f64 * unit));
+        bits >>= 4;
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!(" stroke-dasharray=\"{}\"", parts.join(","))
+}
+
 fn escape_xml(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -602,20 +634,29 @@ impl RustgdDevice {
         }
     }
 
-    fn handle_line(&mut self, x1: f64, y1: f64, x2: f64, y2: f64, col: i32, lwd: f64) {
+    fn handle_line(
+        &mut self,
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+        col: i32,
+        lwd: f64,
+        lty: i32,
+    ) {
         DREW_SOMETHING.store(true, Ordering::SeqCst);
         let y1f = self.flip_y(y1);
         let y2f = self.flip_y(y2);
         let stroke = r_color_to_svg(col);
         let el = format!(
             "<line x1=\"{:.3}\" y1=\"{:.3}\" x2=\"{:.3}\" y2=\"{:.3}\" \
-             stroke=\"{}\" stroke-width=\"{:.3}\" fill=\"none\"/>",
-            x1, y1f, x2, y2f, stroke, lwd
+             stroke=\"{}\" stroke-width=\"{:.3}\"{} fill=\"none\"/>",
+            x1, y1f, x2, y2f, stroke, lwd, lty_to_dasharray(lty, lwd)
         );
         self.buffer.push(el);
     }
 
-    fn handle_polyline(&mut self, xs: &[f64], ys: &[f64], col: i32, lwd: f64) {
+    fn handle_polyline(&mut self, xs: &[f64], ys: &[f64], col: i32, lwd: f64, lty: i32) {
         DREW_SOMETHING.store(true, Ordering::SeqCst);
         let n = xs.len().min(ys.len());
         if n == 0 {
@@ -626,10 +667,11 @@ impl RustgdDevice {
             .map(|i| format!("{:.3},{:.3}", xs[i], self.flip_y(ys[i])))
             .collect();
         let el = format!(
-            "<polyline points=\"{}\" stroke=\"{}\" stroke-width=\"{:.3}\" fill=\"none\"/>",
+            "<polyline points=\"{}\" stroke=\"{}\" stroke-width=\"{:.3}\"{} fill=\"none\"/>",
             points.join(" "),
             stroke,
-            lwd
+            lwd,
+            lty_to_dasharray(lty, lwd)
         );
         self.buffer.push(el);
     }
@@ -643,6 +685,7 @@ impl RustgdDevice {
         col: i32,
         fill: i32,
         lwd: f64,
+        lty: i32,
     ) {
         DREW_SOMETHING.store(true, Ordering::SeqCst);
         let xa = x0.min(x1);
@@ -656,13 +699,21 @@ impl RustgdDevice {
         let fillstr = r_color_to_svg(fill);
         let el = format!(
             "<rect x=\"{:.3}\" y=\"{:.3}\" width=\"{:.3}\" height=\"{:.3}\" \
-             stroke=\"{}\" fill=\"{}\" stroke-width=\"{:.3}\"/>",
-            xa, y_top, width, height, stroke, fillstr, lwd
+             stroke=\"{}\" fill=\"{}\" stroke-width=\"{:.3}\"{}/>",
+            xa, y_top, width, height, stroke, fillstr, lwd, lty_to_dasharray(lty, lwd)
         );
         self.buffer.push(el);
     }
 
-    fn handle_polygon(&mut self, xs: &[f64], ys: &[f64], col: i32, fill: i32, lwd: f64) {
+    fn handle_polygon(
+        &mut self,
+        xs: &[f64],
+        ys: &[f64],
+        col: i32,
+        fill: i32,
+        lwd: f64,
+        lty: i32,
+    ) {
         DREW_SOMETHING.store(true, Ordering::SeqCst);
         let n = xs.len().min(ys.len());
         if n == 0 {
@@ -674,24 +725,34 @@ impl RustgdDevice {
             .map(|i| format!("{:.3},{:.3}", xs[i], self.flip_y(ys[i])))
             .collect();
         let el = format!(
-            "<polygon points=\"{}\" stroke=\"{}\" fill=\"{}\" stroke-width=\"{:.3}\"/>",
+            "<polygon points=\"{}\" stroke=\"{}\" fill=\"{}\" stroke-width=\"{:.3}\"{}/>",
             points.join(" "),
             stroke,
             fillstr,
-            lwd
+            lwd,
+            lty_to_dasharray(lty, lwd)
         );
         self.buffer.push(el);
     }
 
-    fn handle_circle(&mut self, x: f64, y: f64, r: f64, col: i32, fill: i32, lwd: f64) {
+    fn handle_circle(
+        &mut self,
+        x: f64,
+        y: f64,
+        r: f64,
+        col: i32,
+        fill: i32,
+        lwd: f64,
+        lty: i32,
+    ) {
         DREW_SOMETHING.store(true, Ordering::SeqCst);
         let cy = self.flip_y(y);
         let stroke = r_color_to_svg(col);
         let fillstr = r_color_to_svg(fill);
         let el = format!(
             "<circle cx=\"{:.3}\" cy=\"{:.3}\" r=\"{:.3}\" \
-             stroke=\"{}\" fill=\"{}\" stroke-width=\"{:.3}\"/>",
-            x, cy, r, stroke, fillstr, lwd
+             stroke=\"{}\" fill=\"{}\" stroke-width=\"{:.3}\"{}/>",
+            x, cy, r, stroke, fillstr, lwd, lty_to_dasharray(lty, lwd)
         );
         self.buffer.push(el);
     }
@@ -709,6 +770,7 @@ impl RustgdDevice {
         col: i32,
         fill: i32,
         lwd: f64,
+        lty: i32,
     ) {
         DREW_SOMETHING.store(true, Ordering::SeqCst);
         let stroke = r_color_to_svg(col);
@@ -741,9 +803,9 @@ impl RustgdDevice {
 
         let d = d_parts.join(" ");
         let el = format!(
-            "<path d=\"{}\" stroke=\"{}\" fill=\"{}\" stroke-width=\"{:.3}\" \
+            "<path d=\"{}\" stroke=\"{}\" fill=\"{}\" stroke-width=\"{:.3}\"{} \
              fill-rule=\"{}\"/>",
-            d, stroke, fillstr, lwd, fill_rule
+            d, stroke, fillstr, lwd, lty_to_dasharray(lty, lwd), fill_rule
         );
         self.buffer.push(el);
     }
@@ -1048,13 +1110,13 @@ pub unsafe extern "C" fn rustgd_cb_line(
     y2: f64,
     col: i32,
     lwd: f64,
-    _lty: i32,
+    lty: i32,
 ) {
     if dev.is_null() {
         return;
     }
     let device = &mut *(dev as *mut RustgdDevice);
-    device.handle_line(x1, y1, x2, y2, col, lwd);
+    device.handle_line(x1, y1, x2, y2, col, lwd, lty);
 }
 
 #[no_mangle]
@@ -1065,7 +1127,7 @@ pub unsafe extern "C" fn rustgd_cb_polyline(
     y_ptr: *const f64,
     col: i32,
     lwd: f64,
-    _lty: i32,
+    lty: i32,
 ) {
     if dev.is_null() || x_ptr.is_null() || y_ptr.is_null() || n <= 0 {
         return;
@@ -1074,7 +1136,7 @@ pub unsafe extern "C" fn rustgd_cb_polyline(
     let n = n as usize;
     let xs = std::slice::from_raw_parts(x_ptr, n);
     let ys = std::slice::from_raw_parts(y_ptr, n);
-    device.handle_polyline(xs, ys, col, lwd);
+    device.handle_polyline(xs, ys, col, lwd, lty);
 }
 
 #[no_mangle]
@@ -1087,13 +1149,13 @@ pub unsafe extern "C" fn rustgd_cb_rect(
     col: i32,
     fill: i32,
     lwd: f64,
-    _lty: i32,
+    lty: i32,
 ) {
     if dev.is_null() {
         return;
     }
     let device = &mut *(dev as *mut RustgdDevice);
-    device.handle_rect(x0, y0, x1, y1, col, fill, lwd);
+    device.handle_rect(x0, y0, x1, y1, col, fill, lwd, lty);
 }
 
 #[no_mangle]
@@ -1105,7 +1167,7 @@ pub unsafe extern "C" fn rustgd_cb_polygon(
     col: i32,
     fill: i32,
     lwd: f64,
-    _lty: i32,
+    lty: i32,
 ) {
     if dev.is_null() || x_ptr.is_null() || y_ptr.is_null() || n <= 0 {
         return;
@@ -1114,7 +1176,7 @@ pub unsafe extern "C" fn rustgd_cb_polygon(
     let n = n as usize;
     let xs = std::slice::from_raw_parts(x_ptr, n);
     let ys = std::slice::from_raw_parts(y_ptr, n);
-    device.handle_polygon(xs, ys, col, fill, lwd);
+    device.handle_polygon(xs, ys, col, fill, lwd, lty);
 }
 
 #[no_mangle]
@@ -1126,13 +1188,13 @@ pub unsafe extern "C" fn rustgd_cb_circle(
     col: i32,
     fill: i32,
     lwd: f64,
-    _lty: i32,
+    lty: i32,
 ) {
     if dev.is_null() {
         return;
     }
     let device = &mut *(dev as *mut RustgdDevice);
-    device.handle_circle(x, y, r, col, fill, lwd);
+    device.handle_circle(x, y, r, col, fill, lwd, lty);
 }
 
 #[no_mangle]
@@ -1146,7 +1208,7 @@ pub unsafe extern "C" fn rustgd_cb_path(
     col: i32,
     fill: i32,
     lwd: f64,
-    _lty: i32,
+    lty: i32,
 ) {
     if dev.is_null()
         || x_ptr.is_null()
@@ -1164,7 +1226,7 @@ pub unsafe extern "C" fn rustgd_cb_path(
     }
     let xs = std::slice::from_raw_parts(x_ptr, total);
     let ys = std::slice::from_raw_parts(y_ptr, total);
-    device.handle_path(xs, ys, nper, winding != 0, col, fill, lwd);
+    device.handle_path(xs, ys, nper, winding != 0, col, fill, lwd, lty);
 }
 
 #[no_mangle]
