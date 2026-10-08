@@ -166,10 +166,15 @@ fn pid_is_alive(_pid: i32) -> bool {
 // SVG helpers
 // ----------------------------------------------------------------------
 
+/// Convert R's packed rcolor (0xAABBGGRR) into an SVG paint value.
+///
+/// Every bit pattern is a real color. In particular 0x80000000 is black at
+/// alpha 128, which is exactly adjustcolor("black", alpha.f = 0.5). An
+/// earlier version treated that value as NA_INTEGER and drew nothing. The
+/// graphics engine never hands a device NA here because it converts NA
+/// colors to transparent white first, so alpha 0 is the only "no paint"
+/// case.
 fn r_color_to_svg(color: i32) -> String {
-    if color == i32::MIN {
-        return "none".to_string();
-    }
     let r = (color & 0xFF) as u8;
     let g = ((color >> 8) & 0xFF) as u8;
     let b = ((color >> 16) & 0xFF) as u8;
