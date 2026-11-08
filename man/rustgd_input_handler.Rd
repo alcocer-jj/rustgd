@@ -2,16 +2,18 @@
 % Please edit documentation in R/rustgd.R
 \name{rustgd_input_handler}
 \alias{rustgd_input_handler}
-\title{Internal: process a pending resize if one exists. Reads resize.txt,
-updates the device dimensions, and re-evaluates every plot in the
-session history at the new size. Each plot is directed to its own
-plot-NNNN.svg file via rustgd_set_current_page().}
+\title{Internal. Applies a pending resize from resize.txt. The file holds the
+new width and height and, after them, the page number of the plot on
+screen. Nothing is redrawn here. Every plot drawn at another size is
+now stale, and rustgd_rebuild_next() redraws them one per poll,
+starting with the plot on screen.}
 \usage{
 rustgd_input_handler()
 }
 \description{
-Internal: process a pending resize if one exists. Reads resize.txt,
-updates the device dimensions, and re-evaluates every plot in the
-session history at the new size. Each plot is directed to its own
-plot-NNNN.svg file via rustgd_set_current_page().
+Internal. Applies a pending resize from resize.txt. The file holds the
+new width and height and, after them, the page number of the plot on
+screen. Nothing is redrawn here. Every plot drawn at another size is
+now stale, and rustgd_rebuild_next() redraws them one per poll,
+starting with the plot on screen.
 }

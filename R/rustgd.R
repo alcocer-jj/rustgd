@@ -53,6 +53,8 @@ rustgd <- function() {
   )
 
   .rustgd_state$plot_history <- list()
+  .rustgd_state$visible <- NULL
+  .rustgd_state$rebuild_paused <- FALSE
   .rustgd_state$active <- TRUE
   .rustgd_state$session_dir <- file.path(tempdir(), paste0("rustgd-", Sys.getpid()))
 
@@ -98,15 +100,17 @@ rustgd <- function() {
 # Package-level state.
 .rustgd_state <- new.env(parent = emptyenv())
 # plot_history is a list of plot entries, one per logical plot. Each
-# entry is a named list with two fields:
-#   - $recorded: the result of grDevices::recordPlot() captured
-#     immediately after the plot was drawn. This is the primary
-#     re-render mechanism on resize.
-#   - $exprs: the captured top-level expressions that produced the
-#     plot (one for a single-expression plot like a ggplot, multiple
-#     for a layered base plot like plot() + lines() + points()).
-#     Used as a fallback if recordPlot returned NULL or replayPlot
-#     fails at resize time.
+# entry is a named list with four fields.
+#   - $recorded is the result of grDevices::recordPlot() captured right
+#     after the plot was drawn. Replaying it is how a plot is redrawn at
+#     a new size.
+#   - $exprs holds the top-level expressions that produced the plot, one
+#     for a ggplot and several for a layered base plot like plot() then
+#     lines(). They are evaluated again only if the replay fails.
+#   - $page is the device page the plot was drawn on, so the plot always
+#     maps to its own plot-NNNN.svg, even after other plots are cleared.
+#   - $size is the device size the plot was last drawn at. A plot whose
+#     size differs from the device's current size is stale.
 .rustgd_state$plot_history <- list()
 .rustgd_state$active <- FALSE
 .rustgd_state$device_num <- NULL
@@ -114,6 +118,11 @@ rustgd <- function() {
 .rustgd_state$prev_device <- NULL
 # Cancels the next scheduled poll. later::later() returns it.
 .rustgd_state$poll_cancel <- NULL
+# Page number of the plot the viewer is showing.
+.rustgd_state$visible <- NULL
+# Set by Ctrl+C during a redraw. Plots that are off screen then wait
+# until they are viewed instead of being redrawn in the background.
+.rustgd_state$rebuild_paused <- FALSE
 
 #' Internal: tear down the rustgd session. Removes the task callback,
 #' clears state, and optionally closes the R device. Idempotent;
@@ -150,8 +159,10 @@ rustgd_shutdown <- function(close_device = TRUE, remove_callback = TRUE) {
   invisible(NULL)
 }
 
-#' Internal: scheduled poll for resize signals and viewer-close events.
-#' Reschedules itself while the device is active.
+#' Internal. Scheduled poll for viewer signals. It handles a closed
+#' window, Clear all, Clear plot, the plot on screen, and resizes, then
+#' redraws at most one stale plot. It reschedules itself while the
+#' device is active.
 rustgd_poll_resize <- function() {
   if (!isTRUE(.rustgd_state$active)) {
     return(invisible(NULL))
@@ -202,30 +213,56 @@ rustgd_poll_resize <- function() {
         interrupt = function(e) NULL
       )
     }
+
+    # The plot on screen. The viewer writes its page number to view.txt
+    # whenever that changes, by paging or by jumping to a new plot.
+    view_marker <- file.path(session_dir, "view.txt")
+    if (file.exists(view_marker)) {
+      content <- tryCatch(
+        readLines(view_marker, n = 1, warn = FALSE),
+        error = function(e) NULL
+      )
+      try(file.remove(view_marker), silent = TRUE)
+      page <- suppressWarnings(as.integer(content))
+      if (length(page) == 1 && !is.na(page) && page >= 1) {
+        .rustgd_state$visible <- page
+      }
+    }
   }
 
-  # Interrupts are caught as well as errors. Ctrl+C during a long
-  # replay stops that replay and hands the console back.
   tryCatch(
     rustgd_input_handler(),
     error = function(e) NULL,
     interrupt = function(e) NULL
   )
+
+  # Redraw at most one stale plot per poll, so R hands the console back
+  # between plots. Ctrl+C stops the redraw in progress and pauses the
+  # plots that are off screen until they are viewed.
+  tryCatch(
+    rustgd_rebuild_next(),
+    error = function(e) NULL,
+    interrupt = function(e) {
+      .rustgd_state$rebuild_paused <- TRUE
+      NULL
+    }
+  )
   invisible(NULL)
 }
 
-#' Internal: process a pending resize if one exists. Reads resize.txt,
-#' updates the device dimensions, and re-evaluates every plot in the
-#' session history at the new size. Each plot is directed to its own
-#' plot-NNNN.svg file via rustgd_set_current_page().
+#' Internal. Applies a pending resize from resize.txt. The file holds the
+#' new width and height and, after them, the page number of the plot on
+#' screen. Nothing is redrawn here. Every plot drawn at another size is
+#' now stale, and rustgd_rebuild_next() redraws them one per poll,
+#' starting with the plot on screen.
 rustgd_input_handler <- function() {
   session_dir <- .rustgd_state$session_dir
   if (is.null(session_dir)) {
-    return(invisible(NULL))
+    return(invisible(FALSE))
   }
   signal_file <- file.path(session_dir, "resize.txt")
   if (!file.exists(signal_file)) {
-    return(invisible(NULL))
+    return(invisible(FALSE))
   }
 
   content <- tryCatch(
@@ -235,86 +272,180 @@ rustgd_input_handler <- function() {
   try(file.remove(signal_file), silent = TRUE)
 
   if (is.null(content) || length(content) == 0 || nchar(content) == 0) {
-    return(invisible(NULL))
+    return(invisible(FALSE))
   }
 
-  dims <- suppressWarnings(
+  parts <- suppressWarnings(
     as.numeric(strsplit(content, ",", fixed = TRUE)[[1]])
   )
-  if (length(dims) != 2 || any(is.na(dims)) || any(dims <= 0)) {
-    return(invisible(NULL))
+  if (length(parts) < 2 || any(is.na(parts[1:2])) || any(parts[1:2] <= 0)) {
+    return(invisible(FALSE))
   }
 
-  rustgd_set_size(dims[1], dims[2])
+  # rustgd_set_size() acts on the current device. Make rustgd's device
+  # current for it and put back whatever was current, so a png() or pdf()
+  # the user has open is never resized.
+  prev_dev <- dev.cur()
+  dev_num <- .rustgd_state$device_num
+  if (prev_dev != dev_num) {
+    grDevices::dev.set(dev_num)
+    on.exit(if (prev_dev %in% dev.list()) grDevices::dev.set(prev_dev), add = TRUE)
+  }
+  rustgd_set_size(parts[1], parts[2])
 
+  if (length(parts) >= 3 && !is.na(parts[3]) && parts[3] >= 1) {
+    .rustgd_state$visible <- as.integer(parts[3])
+  }
+  # A new size restarts the redraws, which also lifts a pause from Ctrl+C.
+  .rustgd_state$rebuild_paused <- FALSE
+  invisible(TRUE)
+}
+
+#' Internal. Redraws one stale plot, the one most worth redrawing. The plot
+#' on screen comes first. Next is the plot the device itself is on, so a
+#' later lines() or points() lands on an up-to-date plot. After those,
+#' plots go in order of distance from the one on screen, unless Ctrl+C
+#' paused them.
+#' @noRd
+rustgd_rebuild_next <- function() {
   history <- .rustgd_state$plot_history
-  n_plots <- length(history)
-  if (n_plots > 0) {
-    # Enter replay mode: new_page() will not advance the page counter,
-    # so each plot's output goes to whichever file we direct via
-    # rustgd_set_current_page() just before evaluating it. on.exit
-    # restores the counter to the latest plot so the next user-issued
-    # plot() increments cleanly to a fresh page.
-    rustgd_set_replay_mode(TRUE)
-    on.exit(
+  if (length(history) == 0) {
+    return(invisible(FALSE))
+  }
+  size <- rustgd_device_size()
+  stale <- which(vapply(
+    history,
+    function(entry) !(length(entry$size) == 2 && all(entry$size == size)),
+    logical(1)
+  ))
+  if (length(stale) == 0) {
+    return(invisible(FALSE))
+  }
+
+  pages <- vapply(history[stale], function(entry) as.integer(entry$page), integer(1))
+  owner <- rustgd_current_page()
+  visible <- .rustgd_state$visible
+  if (is.null(visible)) {
+    visible <- owner
+  }
+
+  if (visible %in% pages) {
+    i <- stale[match(visible, pages)]
+  } else if (owner %in% pages) {
+    i <- stale[match(owner, pages)]
+  } else if (isTRUE(.rustgd_state$rebuild_paused)) {
+    return(invisible(FALSE))
+  } else {
+    i <- stale[which.min(abs(pages - visible))]
+  }
+  entry <- history[[i]]
+
+  # Redrawing acts on the current device. Make rustgd's device current and
+  # put back whatever was current.
+  prev_dev <- dev.cur()
+  dev_num <- .rustgd_state$device_num
+  if (prev_dev != dev_num) {
+    grDevices::dev.set(dev_num)
+    on.exit(if (prev_dev %in% dev.list()) grDevices::dev.set(prev_dev), add = TRUE)
+  }
+
+  tryCatch(
+    if (isTRUE(entry$page == owner)) {
+      .rustgd_redraw_on_device(entry)
+    } else {
+      .rustgd_redraw_offscreen(entry, size)
+    },
+    error = function(e) NULL
+  )
+
+  # Mark it drawn at this size even if the redraw failed, so a broken plot
+  # is retried on the next resize rather than on every poll. An interrupt
+  # skips this line and leaves the plot stale.
+  .rustgd_state$plot_history[[i]]$size <- size
+  invisible(TRUE)
+}
+
+#' Internal. Replays one recorded plot onto the current device, where its
+#' own layout reflows to the device's size. If the recording is missing or
+#' fails to replay, the plot's expressions are evaluated again instead,
+#' which behaves like a fresh evaluation at the console, including the
+#' auto-print that ggplot and lattice rely on.
+#' @noRd
+.rustgd_replay_entry <- function(entry) {
+  used_recorded <- FALSE
+  if (!is.null(entry$recorded)) {
+    used_recorded <- tryCatch(
       {
-        rustgd_set_replay_mode(FALSE)
-        rustgd_set_current_page(n_plots)
+        grDevices::replayPlot(entry$recorded)
+        tryCatch(grDevices::dev.flush(), error = function(e) NULL)
+        TRUE
       },
-      add = TRUE
+      error = function(e) FALSE
     )
-
-    for (i in seq_len(n_plots)) {
-      rustgd_set_current_page(i)
-      plot_entry <- history[[i]]
-
-      # Primary path: replay the recorded display list. This re-issues
-      # the low-level drawing primitives onto the device at its new
-      # size, which lets the plotting package's own layout choices
-      # (legend placement, panel proportions, outer margins, etc.)
-      # reflow naturally. No R-side construction code re-runs.
-      # dev.flush() is called as a safety measure so the SVG is
-      # written even if replayPlot does not trigger the device's
-      # mode(0) callback on its own.
-      used_recorded <- FALSE
-      if (!is.null(plot_entry$recorded)) {
-        used_recorded <- tryCatch(
-          {
-            grDevices::replayPlot(plot_entry$recorded)
-            tryCatch(grDevices::dev.flush(), error = function(e) NULL)
-            TRUE
-          },
-          error = function(e) FALSE
-        )
-      }
-
-      # Fallback path: re-evaluate the captured expressions. This is
-      # the original Path A behavior and runs only if recordPlot
-      # returned NULL or replayPlot above threw an error. Behaves
-      # like a fresh REPL evaluation, including the auto-print of
-      # visible values that grid-based plots (ggplot, lattice, tmap)
-      # rely on to trigger their draw side effects.
-      if (!used_recorded) {
-        exprs <- plot_entry$exprs
-        if (is.null(exprs)) next
-        for (e in exprs) {
-          tryCatch(
-            {
-              out <- withVisible(eval(e, envir = globalenv()))
-              if (isTRUE(out$visible)) print(out$value)
-            },
-            error = function(err) NULL
-          )
-        }
-      }
+  }
+  if (!used_recorded && !is.null(entry$exprs)) {
+    for (e in entry$exprs) {
+      tryCatch(
+        {
+          out <- withVisible(eval(e, envir = globalenv()))
+          if (isTRUE(out$visible)) print(out$value)
+        },
+        error = function(err) NULL
+      )
     }
   }
+  invisible(NULL)
+}
 
-  # Consume flags set by our replay so the task callback (which fires
-  # for the user's commands, not our internal eval) doesn't get confused.
-  rustgd_check_new_page()
-  rustgd_check_drew()
+#' Internal. Redraws the plot that owns the device's current page on the
+#' device itself, so the device's display list and graphics state end up
+#' at the new size too. Replay mode keeps the page counter still, so the
+#' output overwrites the plot's own file.
+#' @noRd
+.rustgd_redraw_on_device <- function(entry) {
+  owner <- rustgd_current_page()
+  rustgd_set_replay_mode(TRUE)
+  on.exit(
+    {
+      rustgd_set_replay_mode(FALSE)
+      rustgd_set_current_page(owner)
+      # Consume the flags the replay set, so the task callback does not
+      # mistake them for a new plot from the user.
+      rustgd_check_new_page()
+      rustgd_check_drew()
+    },
+    add = TRUE
+  )
+  rustgd_set_current_page(as.integer(entry$page))
+  .rustgd_replay_entry(entry)
+  invisible(NULL)
+}
 
+#' Internal. Redraws any other plot on a short-lived second device that
+#' writes straight to that plot's file and opens no window. The main
+#' device keeps its display list and graphics state, so a later lines()
+#' still adds to the plot it belongs to.
+#' @noRd
+.rustgd_redraw_offscreen <- function(entry, size) {
+  main <- dev.cur()
+  on.exit(
+    {
+      # Close the second device by its name, which also covers an
+      # interrupt that lands before its number could be stored.
+      devices <- dev.list()
+      for (d in devices[names(devices) == "rustgd_offscreen"]) {
+        grDevices::dev.off(d)
+      }
+      if (main %in% dev.list()) {
+        grDevices::dev.set(main)
+      }
+      rustgd_check_new_page()
+      rustgd_check_drew()
+    },
+    add = TRUE
+  )
+  rustgd_open_offscreen(as.integer(entry$page), size[1], size[2])
+  .rustgd_replay_entry(entry)
   invisible(NULL)
 }
 
@@ -365,18 +496,35 @@ rustgd_task_callback <- function(expr) {
   # matching history so closing the window always starts over.
   if (rustgd_take_gallery_reset()) {
     .rustgd_state$plot_history <- list()
+    .rustgd_state$visible <- NULL
   }
 
   if (rustgd_check_new_page()) {
     recorded <- .rustgd_record_current()
+    page <- rustgd_current_page()
     .rustgd_state$plot_history <- c(
       .rustgd_state$plot_history,
-      list(list(exprs = list(expr), recorded = recorded))
+      list(list(
+        exprs = list(expr),
+        recorded = recorded,
+        page = page,
+        size = rustgd_device_size()
+      ))
     )
+    # The viewer jumps to a new plot, so it is the one on screen.
+    .rustgd_state$visible <- page
     rustgd_check_drew()
   } else if (rustgd_check_drew()) {
-    n <- length(.rustgd_state$plot_history)
-    if (n > 0) {
+    # Additions such as lines() land on the page the device is on, so
+    # they belong to the entry that owns that page.
+    page <- rustgd_current_page()
+    owns <- which(vapply(
+      .rustgd_state$plot_history,
+      function(entry) isTRUE(entry$page == page),
+      logical(1)
+    ))
+    if (length(owns) > 0) {
+      n <- owns[length(owns)]
       recorded <- .rustgd_record_current()
       .rustgd_state$plot_history[[n]]$exprs <- c(
         .rustgd_state$plot_history[[n]]$exprs,
@@ -388,6 +536,7 @@ rustgd_task_callback <- function(expr) {
       if (!is.null(recorded)) {
         .rustgd_state$plot_history[[n]]$recorded <- recorded
       }
+      .rustgd_state$plot_history[[n]]$size <- rustgd_device_size()
     }
   }
   invisible(NULL)
@@ -407,6 +556,8 @@ rustgd_handle_clear_all <- function() {
   try(file.remove(file.path(session_dir, "clear_all.txt")), silent = TRUE)
 
   .rustgd_state$plot_history <- list()
+  .rustgd_state$visible <- NULL
+  .rustgd_state$rebuild_paused <- FALSE
 
   svg_files <- list.files(
     session_dir,
@@ -421,12 +572,10 @@ rustgd_handle_clear_all <- function() {
   invisible(NULL)
 }
 
-#' Internal: process a clear-active-plot signal from the viewer. The
-#' marker file contains the 1-based index of the plot to remove. The
-#' entry is dropped from plot_history, the corresponding SVG file is
-#' deleted, and any higher-numbered files are renamed down by one so
-#' the on-disk numbering stays contiguous and matches the new history
-#' indices.
+#' Internal. Processes a clear-plot signal from the viewer. The marker
+#' file holds the page number of the plot to remove. Its file is deleted,
+#' every higher page moves down by one, and plot_history changes the same
+#' way, so files and history stay in step.
 rustgd_handle_clear_plot <- function() {
   session_dir <- .rustgd_state$session_dir
   if (is.null(session_dir)) {
@@ -444,38 +593,52 @@ rustgd_handle_clear_plot <- function() {
     return(invisible(NULL))
   }
 
-  idx <- suppressWarnings(as.integer(content))
-  if (is.na(idx) || idx < 1) {
+  page <- suppressWarnings(as.integer(content))
+  if (is.na(page) || page < 1) {
     return(invisible(NULL))
   }
 
-  n_plots <- length(.rustgd_state$plot_history)
-  if (idx > n_plots) {
+  files <- list.files(session_dir, pattern = "^plot-[0-9]+\\.svg$")
+  file_pages <- as.integer(sub("^plot-([0-9]+)\\.svg$", "\\1", files))
+  if (!(page %in% file_pages)) {
     return(invisible(NULL))
   }
 
-  # Drop the entry from history.
-  .rustgd_state$plot_history <- .rustgd_state$plot_history[-idx]
+  # Delete the plot's file, then move every higher page down by one.
+  try(
+    file.remove(file.path(session_dir, sprintf("plot-%04d.svg", page))),
+    silent = TRUE
+  )
+  for (p in sort(file_pages[file_pages > page])) {
+    try(
+      file.rename(
+        file.path(session_dir, sprintf("plot-%04d.svg", p)),
+        file.path(session_dir, sprintf("plot-%04d.svg", p - 1L))
+      ),
+      silent = TRUE
+    )
+  }
 
-  # Delete the file for the removed plot.
-  target_file <- file.path(session_dir, sprintf("plot-%04d.svg", idx))
-  try(file.remove(target_file), silent = TRUE)
-
-  # Shift higher-numbered files down by one so numbering stays
-  # contiguous and aligned with the new history indices.
-  if (idx < n_plots) {
-    for (i in (idx + 1):n_plots) {
-      old_file <- file.path(session_dir, sprintf("plot-%04d.svg", i))
-      new_file <- file.path(session_dir, sprintf("plot-%04d.svg", i - 1))
-      if (file.exists(old_file)) {
-        try(file.rename(old_file, new_file), silent = TRUE)
-      }
+  # The history changes the same way.
+  history <- .rustgd_state$plot_history
+  keep <- vapply(history, function(entry) !isTRUE(entry$page == page), logical(1))
+  history <- history[keep]
+  for (i in seq_along(history)) {
+    if (isTRUE(history[[i]]$page > page)) {
+      history[[i]]$page <- history[[i]]$page - 1L
     }
   }
+  .rustgd_state$plot_history <- history
 
-  # Update the page counter to match the new history length so the
-  # next user-issued plot() increments to the right slot.
-  rustgd_set_current_page(length(.rustgd_state$plot_history))
+  # So do the device's own page counter and the plot on screen.
+  owner <- rustgd_current_page()
+  if (owner >= page) {
+    rustgd_set_current_page(owner - 1L)
+  }
+  visible <- .rustgd_state$visible
+  if (!is.null(visible) && visible > page) {
+    .rustgd_state$visible <- visible - 1L
+  }
   invisible(NULL)
 }
 

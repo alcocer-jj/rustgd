@@ -535,13 +535,39 @@ impl DrawBuffer {
 // The device
 // ----------------------------------------------------------------------
 
+/// Read and check the bundled fonts the device measures text with.
+fn load_fonts(fonts_dir: &std::path::Path) -> Result<[[Vec<u8>; NUM_FACES]; NUM_FAMILIES], Error> {
+    let mut font_bytes: [[Vec<u8>; NUM_FACES]; NUM_FAMILIES] = Default::default();
+    for (fam_idx, fam_files) in FONT_FILES.iter().enumerate() {
+        for (face_idx, name) in fam_files.iter().enumerate() {
+            let path = fonts_dir.join(name);
+            if !path.exists() {
+                return Err(Error::Other(format!(
+                    "missing font file: {}",
+                    path.display()
+                )));
+            }
+            let bytes =
+                fs::read(&path).map_err(|e| Error::Other(format!("read {name}: {e}")))?;
+            ttf_parser::Face::parse(&bytes, 0)
+                .map_err(|e| Error::Other(format!("parse {name}: {e:?}")))?;
+            font_bytes[fam_idx][face_idx] = bytes;
+        }
+    }
+    Ok(font_bytes)
+}
+
 struct RustgdDevice {
     dir: PathBuf,
     /// The viewer binary and fonts folder, kept so the window can be
     /// reopened if it is closed before R notices.
     viewer_bin: PathBuf,
     fonts_dir: PathBuf,
-    viewer_child: std::process::Child,
+    /// The viewer process. None for a redraw device, which opens no window.
+    viewer_child: Option<std::process::Child>,
+    /// Set on a short-lived redraw device. It always writes this page's
+    /// file and leaves the page counter and session folder alone.
+    offscreen_page: Option<usize>,
     buffer: DrawBuffer,
     font_bytes: [[Vec<u8>; NUM_FACES]; NUM_FAMILIES],
 }
@@ -555,23 +581,7 @@ impl RustgdDevice {
         let viewer = locate_viewer()?;
         let fonts_dir = locate_fonts_dir()?;
 
-        let mut font_bytes: [[Vec<u8>; NUM_FACES]; NUM_FAMILIES] = Default::default();
-        for (fam_idx, fam_files) in FONT_FILES.iter().enumerate() {
-            for (face_idx, name) in fam_files.iter().enumerate() {
-                let path = fonts_dir.join(name);
-                if !path.exists() {
-                    return Err(Error::Other(format!(
-                        "missing font file: {}",
-                        path.display()
-                    )));
-                }
-                let bytes =
-                    fs::read(&path).map_err(|e| Error::Other(format!("read {name}: {e}")))?;
-                ttf_parser::Face::parse(&bytes, 0)
-                    .map_err(|e| Error::Other(format!("parse {name}: {e:?}")))?;
-                font_bytes[fam_idx][face_idx] = bytes;
-            }
-        }
+        let font_bytes = load_fonts(&fonts_dir)?;
 
         let child = Command::new(&viewer)
             .arg(&dir)
@@ -583,7 +593,28 @@ impl RustgdDevice {
             dir,
             viewer_bin: viewer,
             fonts_dir,
-            viewer_child: child,
+            viewer_child: Some(child),
+            offscreen_page: None,
+            buffer: DrawBuffer::new(),
+            font_bytes,
+        })
+    }
+
+    /// A redraw device. R opens one briefly to redraw a plot other than the
+    /// one the main device is on. It writes that plot's file at the size R
+    /// registers it with, launches no viewer, and shares the session folder
+    /// and fonts with the main device.
+    fn new_offscreen(page: usize) -> Result<Self, Error> {
+        let dir = session_dir();
+        fs::create_dir_all(&dir).map_err(|e| Error::Other(format!("create session dir: {e}")))?;
+        let fonts_dir = locate_fonts_dir()?;
+        let font_bytes = load_fonts(&fonts_dir)?;
+        Ok(Self {
+            dir,
+            viewer_bin: PathBuf::new(),
+            fonts_dir,
+            viewer_child: None,
+            offscreen_page: Some(page),
             buffer: DrawBuffer::new(),
             font_bytes,
         })
@@ -598,7 +629,11 @@ impl RustgdDevice {
     /// the close itself. So the old plots are deleted, the page count goes
     /// back to zero, and R is told to drop its plot history.
     fn ensure_viewer(&mut self) {
-        if let Ok(Some(_)) = self.viewer_child.try_wait() {
+        let exited = matches!(
+            self.viewer_child.as_mut().map(|child| child.try_wait()),
+            Some(Ok(Some(_)))
+        );
+        if exited {
             if let Ok(entries) = fs::read_dir(&self.dir) {
                 for entry in entries.flatten() {
                     let name = entry.file_name();
@@ -612,7 +647,13 @@ impl RustgdDevice {
             // marker would make the R-side poll shut the device down under
             // the new window, and an unread clear request would delete the
             // plot that is about to be drawn.
-            for name in ["viewer_closed", "resize.txt", "clear_plot.txt", "clear_all.txt"] {
+            for name in [
+                "viewer_closed",
+                "resize.txt",
+                "view.txt",
+                "clear_plot.txt",
+                "clear_all.txt",
+            ] {
                 let _ = fs::remove_file(self.dir.join(name));
             }
             CURRENT_PAGE.store(0, Ordering::SeqCst);
@@ -622,7 +663,7 @@ impl RustgdDevice {
                 .arg(&self.fonts_dir)
                 .spawn()
             {
-                self.viewer_child = child;
+                self.viewer_child = Some(child);
             }
         }
     }
@@ -631,7 +672,9 @@ impl RustgdDevice {
         if !self.buffer.has_content {
             return;
         }
-        let n = CURRENT_PAGE.load(Ordering::SeqCst);
+        let n = self
+            .offscreen_page
+            .unwrap_or_else(|| CURRENT_PAGE.load(Ordering::SeqCst));
         if n == 0 {
             // No page has been started yet (no new_page() has fired);
             // nothing meaningful to write.
@@ -736,7 +779,7 @@ impl RustgdDevice {
         // expression), don't advance the page counter: we want the
         // replay to overwrite the existing page's file rather than
         // create a new entry.
-        if !REPLAY_IN_PROGRESS.load(Ordering::SeqCst) {
+        if self.offscreen_page.is_none() && !REPLAY_IN_PROGRESS.load(Ordering::SeqCst) {
             // A user-issued plot. Make sure it has a window to land in.
             self.ensure_viewer();
             CURRENT_PAGE.fetch_add(1, Ordering::SeqCst);
@@ -1198,8 +1241,14 @@ pub unsafe extern "C" fn rustgd_cb_close(dev: *mut c_void) {
     // font_bytes, dir, Child handle) have all been released. The Child
     // handle's Drop does not kill the viewer process; the viewer keeps
     // running until the user closes its window.
-    let boxed = Box::from_raw(dev as *mut RustgdDevice);
-    let _ = fs::remove_dir_all(&boxed.dir);
+    let mut boxed = Box::from_raw(dev as *mut RustgdDevice);
+    if boxed.offscreen_page.is_some() {
+        // A redraw device writes its page and leaves the session folder,
+        // which belongs to the main device, alone.
+        boxed.flush();
+    } else {
+        let _ = fs::remove_dir_all(&boxed.dir);
+    }
 }
 
 #[no_mangle]
@@ -1572,6 +1621,43 @@ fn rustgd_take_gallery_reset() -> bool {
     GALLERY_RESET.swap(false, Ordering::SeqCst)
 }
 
+// The page the main device is on. R stores it with each plot so a plot
+// always maps to its own file.
+#[extendr]
+fn rustgd_current_page() -> i32 {
+    CURRENT_PAGE.load(Ordering::SeqCst) as i32
+}
+
+// The main device's size in device units, as R last set it.
+#[extendr]
+fn rustgd_device_size() -> Vec<f64> {
+    let (w, h) = *CURRENT_SIZE.lock().unwrap();
+    vec![w, h]
+}
+
+// Open a short-lived redraw device for one page at the given size and make
+// it R's current device. R closes it with dev.off() once the plot is drawn.
+#[extendr]
+fn rustgd_open_offscreen(page: i32, width: f64, height: f64) {
+    let page = if page < 1 { 1 } else { page as usize };
+    let device_box = match RustgdDevice::new_offscreen(page) {
+        Ok(d) => Box::new(d),
+        Err(e) => {
+            extendr_api::throw_r_error(&format!("rustgd redraw device failed: {e:?}"));
+        }
+    };
+    let raw_ptr = Box::into_raw(device_box) as *mut c_void;
+    let name = std::ffi::CString::new("rustgd_offscreen").unwrap();
+    let result =
+        unsafe { rustgd_register_device(raw_ptr, width.max(1.0), height.max(1.0), name.as_ptr()) };
+    if result != 0 {
+        unsafe {
+            let _ = Box::from_raw(raw_ptr as *mut RustgdDevice);
+        }
+        extendr_api::throw_r_error("rustgd: failed to register the redraw device");
+    }
+}
+
 extendr_module! {
     mod rustgd;
     fn rustgd_activate;
@@ -1581,4 +1667,7 @@ extendr_module! {
     fn rustgd_set_replay_mode;
     fn rustgd_set_current_page;
     fn rustgd_take_gallery_reset;
+    fn rustgd_current_page;
+    fn rustgd_device_size;
+    fn rustgd_open_offscreen;
 }

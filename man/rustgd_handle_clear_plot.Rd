@@ -2,20 +2,16 @@
 % Please edit documentation in R/rustgd.R
 \name{rustgd_handle_clear_plot}
 \alias{rustgd_handle_clear_plot}
-\title{Internal: process a clear-active-plot signal from the viewer. The
-marker file contains the 1-based index of the plot to remove. The
-entry is dropped from plot_history, the corresponding SVG file is
-deleted, and any higher-numbered files are renamed down by one so
-the on-disk numbering stays contiguous and matches the new history
-indices.}
+\title{Internal. Processes a clear-plot signal from the viewer. The marker
+file holds the page number of the plot to remove. Its file is deleted,
+every higher page moves down by one, and plot_history changes the same
+way, so files and history stay in step.}
 \usage{
 rustgd_handle_clear_plot()
 }
 \description{
-Internal: process a clear-active-plot signal from the viewer. The
-marker file contains the 1-based index of the plot to remove. The
-entry is dropped from plot_history, the corresponding SVG file is
-deleted, and any higher-numbered files are renamed down by one so
-the on-disk numbering stays contiguous and matches the new history
-indices.
+Internal. Processes a clear-plot signal from the viewer. The marker
+file holds the page number of the plot to remove. Its file is deleted,
+every higher page moves down by one, and plot_history changes the same
+way, so files and history stay in step.
 }

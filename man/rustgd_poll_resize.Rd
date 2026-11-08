@@ -2,12 +2,16 @@
 % Please edit documentation in R/rustgd.R
 \name{rustgd_poll_resize}
 \alias{rustgd_poll_resize}
-\title{Internal: scheduled poll for resize signals and viewer-close events.
-Reschedules itself while the device is active.}
+\title{Internal. Scheduled poll for viewer signals. It handles a closed
+window, Clear all, Clear plot, the plot on screen, and resizes, then
+redraws at most one stale plot. It reschedules itself while the
+device is active.}
 \usage{
 rustgd_poll_resize()
 }
 \description{
-Internal: scheduled poll for resize signals and viewer-close events.
-Reschedules itself while the device is active.
+Internal. Scheduled poll for viewer signals. It handles a closed
+window, Clear all, Clear plot, the plot on screen, and resizes, then
+redraws at most one stale plot. It reschedules itself while the
+device is active.
 }

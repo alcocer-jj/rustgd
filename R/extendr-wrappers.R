@@ -19,4 +19,10 @@ rustgd_set_current_page <- function(page) .Call(wrap__rustgd_set_current_page, p
 
 rustgd_take_gallery_reset <- function() .Call(wrap__rustgd_take_gallery_reset)
 
+rustgd_current_page <- function() .Call(wrap__rustgd_current_page)
+
+rustgd_device_size <- function() .Call(wrap__rustgd_device_size)
+
+rustgd_open_offscreen <- function(page, width, height) .Call(wrap__rustgd_open_offscreen, page, width, height)
+
 # nolint end

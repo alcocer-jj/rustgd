@@ -13,7 +13,9 @@
 //! Detects window resize and writes resize.txt into the watch directory
 //! once the size has held still, so the R side can apply the new
 //! dimensions and replay the plots. While a resize is in progress the
-//! last image is stretched to fit instead of being redrawn.
+//! last image is stretched to fit instead of being redrawn. It also
+//! writes view.txt whenever the plot on screen changes, so R knows
+//! which plot to redraw first.
 //!
 //! On exit (user closes the window), writes a `viewer_closed`
 //! signal file into the watch directory so the R-side poller
@@ -183,6 +185,8 @@ struct ViewerApp {
     /// Last available size we wrote a resize signal for. Used to
     /// detect when the window has changed.
     last_signaled_size: Option<(u32, u32)>,
+    /// Page number last sent to R in view.txt.
+    last_signaled_view: Option<u32>,
     /// When did we last detect a size change? Used for debouncing.
     size_change_pending: Option<(Instant, (u32, u32))>,
     /// The plot area's logical-pixel size as of the last frame.
@@ -299,6 +303,7 @@ impl ViewerApp {
             last_poll: now,
             poll_interval: Duration::from_millis(10),
             last_signaled_size: None,
+            last_signaled_view: None,
             size_change_pending: None,
             last_plot_area_logical: (0, 0),
             export_dialog_open: false,
@@ -377,6 +382,22 @@ impl ViewerApp {
         self.svg_paths.get(self.current_index)
     }
 
+    /// Page number of the plot on screen, read from its file name. R keys
+    /// its history by page, which stays right even when numbering has gaps.
+    fn current_page_number(&self) -> Option<u32> {
+        let stem = self.current_path()?.file_stem()?.to_str()?;
+        stem.strip_prefix("plot-")?.parse().ok()
+    }
+
+    /// Write a signal file for the R side. Writing to a temporary name and
+    /// renaming means R never reads a half-written file.
+    fn write_signal(&self, name: &str, contents: &str) {
+        let tmp = self.watch_dir.join(format!("{name}.tmp"));
+        if std::fs::write(&tmp, contents).is_ok() {
+            let _ = std::fs::rename(&tmp, self.watch_dir.join(name));
+        }
+    }
+
     /// Return zoom and pan to the fit view. Called whenever the
     /// displayed plot changes so a new plot is never shown through a
     /// stale zoom or pan offset.
@@ -390,21 +411,16 @@ impl ViewerApp {
     /// page counter. The viewer's directory poll then sees the empty
     /// dir and shows "no plots".
     fn signal_clear_all(&self) {
-        let signal_path = self.watch_dir.join("clear_all.txt");
-        let _ = std::fs::write(&signal_path, b"");
+        self.write_signal("clear_all.txt", "");
     }
 
-    /// Write a clear-active marker file containing the 1-based index
-    /// of the currently-displayed plot. The R-side poller removes that
-    /// entry from plot_history, deletes the corresponding SVG file,
-    /// and renumbers higher-indexed files down by one.
+    /// Write a clear-plot marker file holding the page number of the
+    /// plot on screen. The R-side poller removes that plot from its
+    /// history, deletes its file, and moves higher pages down by one.
     fn signal_clear_active(&self) {
-        if self.svg_paths.is_empty() {
-            return;
+        if let Some(page) = self.current_page_number() {
+            self.write_signal("clear_plot.txt", &page.to_string());
         }
-        let signal_path = self.watch_dir.join("clear_plot.txt");
-        let contents = format!("{}", self.current_index + 1);
-        let _ = std::fs::write(&signal_path, contents);
     }
 
     /// Pre-fill the export dialog from the current window logical
@@ -672,11 +688,26 @@ impl ViewerApp {
 
         let (changed_at, pending_size) = self.size_change_pending.unwrap();
         if now.duration_since(changed_at) >= DEBOUNCE {
-            let signal_path = self.watch_dir.join("resize.txt");
-            let contents = format!("{},{}", pending_size.0, pending_size.1);
-            let _ = std::fs::write(&signal_path, contents);
+            // The page number on the end tells R which plot to redraw first.
+            let contents = match self.current_page_number() {
+                Some(page) => format!("{},{},{}", pending_size.0, pending_size.1, page),
+                None => format!("{},{}", pending_size.0, pending_size.1),
+            };
+            self.write_signal("resize.txt", &contents);
             self.last_signaled_size = Some(pending_size);
             self.size_change_pending = None;
+        }
+    }
+
+    /// Tell R which plot is on screen whenever that changes, by paging or
+    /// by jumping to a new plot. After a resize, R redraws that plot first.
+    fn maybe_signal_view(&mut self) {
+        let page = self.current_page_number();
+        if page.is_some() && page != self.last_signaled_view {
+            if let Some(p) = page {
+                self.write_signal("view.txt", &p.to_string());
+            }
+            self.last_signaled_view = page;
         }
     }
 
@@ -955,6 +986,7 @@ impl eframe::App for ViewerApp {
 
         // Show any image the render thread has finished.
         self.receive_results(ctx);
+        self.maybe_signal_view();
 
         // Keyboard navigation. Sample the input flags before mutating
         // self so we don't hold a borrow on ctx.input across mutations.
