@@ -1,32 +1,38 @@
-//! rustgd-viewer: the standalone window the device's R-side launches.
-//! Watches a directory passed as argv[1], displays SVG plots.
-//! Loads a bundled fonts directory from argv[2] — Liberation Sans is
+//! rustgd-viewer, the standalone window the device's R side launches.
+//! Watches a directory passed as argv[1] and displays the SVG plots in it.
+//! Loads a bundled fonts directory from argv[2]. Liberation Sans is
 //! registered as egui's primary font so the toolbar's arrows render
 //! correctly and the UI typography matches the SVG plot typography.
 //!
-//! Detects window resize and writes resize.txt into the watch
-//! directory so the R-side task callback can apply the new
-//! dimensions and trigger a display list replay of every plot in
-//! the session history.
+//! Parsing and rasterizing happen on a background render thread, never on
+//! the window thread, so the window keeps responding to clicks, resizing,
+//! and the close button while a heavy plot renders. The render thread
+//! always works on the newest request and drops stale ones. Large files
+//! get a quick low-resolution pass first so they appear sooner.
+//!
+//! Detects window resize and writes resize.txt into the watch directory
+//! once the size has held still, so the R side can apply the new
+//! dimensions and replay the plots. While a resize is in progress the
+//! last image is stretched to fit instead of being redrawn.
 //!
 //! On exit (user closes the window), writes a `viewer_closed`
 //! signal file into the watch directory so the R-side poller
 //! can call `dev.off()` and clean up the session.
 //!
-//! Gallery view: all SVG files in the watch directory are sorted
-//! ascending and navigable with prev/next buttons in the top
-//! toolbar, or with the Left/Right/Home/End keys. When a new plot
-//! arrives, the view auto-jumps to it. Cache invalidation tracks
-//! file modification time so in-place overwrites (resize replays)
-//! are picked up reliably.
+//! Gallery view. All SVG files in the watch directory are sorted
+//! ascending and navigable with prev/next buttons in the top toolbar,
+//! or with the Left/Right/Home/End keys. When a new plot arrives, the
+//! view auto-jumps to it. A changed file modification time (an in-place
+//! overwrite such as a resize replay) triggers a new render.
 //!
-//! The UI follows the OS appearance setting (Light / Dark on macOS),
+//! The UI follows the OS appearance setting (Light or Dark on macOS),
 //! including runtime changes. The plot itself keeps R's native
-//! background — typically white — regardless of UI theme.
+//! background, typically white, regardless of UI theme.
 #![windows_subsystem = "windows"]
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui;
 use tiny_skia::{Pixmap, Transform};
@@ -41,6 +47,25 @@ use tiny_skia::{Pixmap, Transform};
 /// per render. Export-to-PNG is unaffected; it has its own DPI-driven
 /// resolution choice.
 const SUPERSAMPLE: f32 = 2.0;
+
+/// How long the plot area must keep one size before the viewer redraws
+/// at that size and tells R to replay. Until then the last image is
+/// stretched to fit on the GPU, which costs nothing.
+const RESIZE_SETTLE: Duration = Duration::from_millis(150);
+
+/// For heavy plots, a resize alone waits this long before redrawing the
+/// old file at the new size, because R's replay at the new size usually
+/// lands first and makes that redraw unnecessary.
+const HEAVY_RESIZE_SETTLE: Duration = Duration::from_millis(1500);
+
+/// SVG files at least this large get a quick low-resolution pass before
+/// the full one, so a heavy plot shows up right away. Setting it to
+/// u64::MAX turns the quick pass off.
+const PREVIEW_MIN_BYTES: u64 = 2_000_000;
+
+/// How long a render may run before the "Rendering" note appears, so
+/// fast plots never flash it.
+const BUSY_NOTE_DELAY: Duration = Duration::from_millis(250);
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -60,17 +85,14 @@ fn main() {
         ..Default::default()
     };
 
-    // Keep copies of the watch and fonts directories for the closure
-    // and post-run signal.
+    // Keep a copy of the watch directory for the post-run signal.
     let watch_dir_for_close = watch_dir.clone();
-    let fonts_dir_for_egui = fonts_dir.clone();
 
-    let app = ViewerApp::new(watch_dir, fonts_dir);
     let _ = eframe::run_native(
         "rustgd",
         options,
         Box::new(move |cc| {
-            setup_egui_fonts(&cc.egui_ctx, fonts_dir_for_egui.as_deref());
+            setup_egui_fonts(&cc.egui_ctx, fonts_dir.as_deref());
             // Follow the OS appearance setting (Light / Dark). egui
             // re-evaluates the system theme on relevant events, so a
             // mid-session toggle of macOS Appearance updates the UI
@@ -79,7 +101,13 @@ fn main() {
             cc.egui_ctx.options_mut(|opts| {
                 opts.theme_preference = egui::ThemePreference::System;
             });
-            Ok(Box::new(app))
+            // The app is built here because its render thread needs the
+            // egui context to wake the window when an image is ready.
+            Ok(Box::new(ViewerApp::new(
+                watch_dir,
+                fonts_dir,
+                cc.egui_ctx.clone(),
+            )))
         }),
     );
 
@@ -121,13 +149,35 @@ struct ViewerApp {
     /// Index into `svg_paths` of the plot currently displayed. Valid
     /// only when `svg_paths` is non-empty.
     current_index: usize,
-    cached: Option<CachedRender>,
+    /// What the texture currently holds. None until the first image
+    /// arrives from the render thread.
+    displayed: Option<Displayed>,
     /// The single GPU texture the plot is drawn into. Reused across
     /// renders via `TextureHandle::set` rather than allocating a new
     /// texture each frame, so a resize never holds the old and new
     /// textures alive at the same time. None until the first render,
     /// and released when there is no plot to show.
     texture: Option<egui::TextureHandle>,
+    /// Hand-off slot to the render thread, which always takes the newest
+    /// job and drops any it never started.
+    jobs: Arc<JobSlot>,
+    /// Finished images coming back from the render thread.
+    results: mpsc::Receiver<RenderResult>,
+    /// The last job sent, so the same work is never asked for twice.
+    requested: Option<RenderKey>,
+    /// When the last job was sent, for the "Rendering" note.
+    requested_at: Instant,
+    /// Id for the next job. Results from jobs sent before the shown plot
+    /// last changed have ids below accept_from and are dropped.
+    next_job_id: u64,
+    accept_from: u64,
+    /// Set when the newest job for the shown plot could not be parsed.
+    last_failed: Option<RenderKey>,
+    /// The raster size seen on the last frame, when it last changed, and
+    /// the size once it has held still for RESIZE_SETTLE.
+    seen_target: (u32, u32),
+    target_changed_at: Instant,
+    settled_target: Option<(u32, u32)>,
     last_poll: Instant,
     poll_interval: Duration,
     /// Last available size we wrote a resize signal for. Used to
@@ -173,26 +223,80 @@ enum ExportFormat {
     Svg,
 }
 
-struct CachedRender {
-    svg_path: PathBuf,
-    target_size: (u32, u32),
+/// Which file version and size the displayed image came from.
+struct Displayed {
+    path: PathBuf,
+    mtime: SystemTime,
+    target: (u32, u32),
+    /// False while a quick low-resolution pass is on screen.
+    full_quality: bool,
+    /// Pixel size of the image. Drawing only uses its aspect ratio.
     rendered_size: egui::Vec2,
-    /// Modification time of the SVG file at the moment it was
-    /// rasterized. Used to detect that R has overwritten the file
-    /// in place (e.g. after a resize replay) so we re-read it.
-    mtime: std::time::SystemTime,
+}
+
+/// One render request. A file version (path plus mtime) at a raster size.
+#[derive(Clone, PartialEq)]
+struct RenderKey {
+    path: PathBuf,
+    mtime: SystemTime,
+    target: (u32, u32),
+}
+
+struct RenderJob {
+    id: u64,
+    key: RenderKey,
+    /// Pixel size for a quick first pass, set only for heavy files.
+    preview: Option<(u32, u32)>,
+}
+
+struct RenderResult {
+    id: u64,
+    key: RenderKey,
+    /// False for the quick first pass.
+    full_quality: bool,
+    /// None when the file could not be read or parsed.
+    image: Option<(egui::ColorImage, egui::Vec2)>,
+}
+
+/// Holds at most one waiting job. Sending a new one replaces it.
+struct JobSlot {
+    job: Mutex<Option<RenderJob>>,
+    wake: Condvar,
 }
 
 impl ViewerApp {
-    fn new(watch_dir: PathBuf, fonts_dir: Option<PathBuf>) -> Self {
+    fn new(watch_dir: PathBuf, fonts_dir: Option<PathBuf>, ctx: egui::Context) -> Self {
+        let jobs = Arc::new(JobSlot {
+            job: Mutex::new(None),
+            wake: Condvar::new(),
+        });
+        let (result_tx, result_rx) = mpsc::channel();
+        {
+            let jobs = Arc::clone(&jobs);
+            let fonts_dir = fonts_dir.clone();
+            let _ = std::thread::Builder::new()
+                .name("rustgd-render".to_string())
+                .spawn(move || render_thread(jobs, result_tx, ctx, fonts_dir));
+        }
+        let now = Instant::now();
         Self {
             watch_dir,
             fonts_dir,
             svg_paths: Vec::new(),
             current_index: 0,
-            cached: None,
+            displayed: None,
             texture: None,
-            last_poll: Instant::now(),
+            jobs,
+            results: result_rx,
+            requested: None,
+            requested_at: now,
+            next_job_id: 0,
+            accept_from: 0,
+            last_failed: None,
+            seen_target: (0, 0),
+            target_changed_at: now,
+            settled_target: None,
+            last_poll: now,
             poll_interval: Duration::from_millis(10),
             last_signaled_size: None,
             size_change_pending: None,
@@ -231,7 +335,7 @@ impl ViewerApp {
             // changes — matches the R console and httpgd behavior.
             self.svg_paths = new_paths;
             self.current_index = self.svg_paths.len().saturating_sub(1);
-            self.cached = None;
+            self.view_changed();
             self.reset_zoom();
         }
     }
@@ -239,7 +343,7 @@ impl ViewerApp {
     fn prev(&mut self) {
         if self.current_index > 0 {
             self.current_index -= 1;
-            self.cached = None;
+            self.view_changed();
             self.reset_zoom();
         }
     }
@@ -247,7 +351,7 @@ impl ViewerApp {
     fn next(&mut self) {
         if self.current_index + 1 < self.svg_paths.len() {
             self.current_index += 1;
-            self.cached = None;
+            self.view_changed();
             self.reset_zoom();
         }
     }
@@ -255,7 +359,7 @@ impl ViewerApp {
     fn goto_first(&mut self) {
         if !self.svg_paths.is_empty() && self.current_index != 0 {
             self.current_index = 0;
-            self.cached = None;
+            self.view_changed();
             self.reset_zoom();
         }
     }
@@ -264,7 +368,7 @@ impl ViewerApp {
         let last = self.svg_paths.len().saturating_sub(1);
         if !self.svg_paths.is_empty() && self.current_index != last {
             self.current_index = last;
-            self.cached = None;
+            self.view_changed();
             self.reset_zoom();
         }
     }
@@ -325,9 +429,9 @@ impl ViewerApp {
         let target_w_px = (self.export_width_in * self.export_dpi as f32).max(1.0);
         let target_h_px = (self.export_height_in * self.export_dpi as f32).max(1.0);
 
-        if let Some(c) = &self.cached {
-            if c.rendered_size.x > 0.0 && c.rendered_size.y > 0.0 {
-                let svg_aspect = c.rendered_size.x / c.rendered_size.y;
+        if let Some(d) = &self.displayed {
+            if d.rendered_size.x > 0.0 && d.rendered_size.y > 0.0 {
+                let svg_aspect = d.rendered_size.x / d.rendered_size.y;
                 let target_aspect = target_w_px / target_h_px;
                 return if target_aspect > svg_aspect {
                     // Box is wider than the plot; height is the limit.
@@ -545,10 +649,11 @@ impl ViewerApp {
     }
 
     /// Write the current plot-area dimensions to resize.txt so the
-    /// R-side task callback can trigger a display list replay.
-    /// Debounced by 5ms — we don't spam writes during active dragging.
+    /// R side can replay the plots at the new size. The write waits until
+    /// the size has held for RESIZE_SETTLE, so a drag does not make R
+    /// replay at every size it passes through.
     fn maybe_signal_resize(&mut self, current_size: (u32, u32)) {
-        const DEBOUNCE: Duration = Duration::from_millis(5);
+        const DEBOUNCE: Duration = RESIZE_SETTLE;
 
         if Some(current_size) == self.last_signaled_size {
             return;
@@ -575,69 +680,214 @@ impl ViewerApp {
         }
     }
 
-    /// Rasterize `path` at the given supersampled target size and
-    /// return the CPU-side image plus its pixel dimensions. The
-    /// tiny-skia pixmap is scoped to this function, so it is freed
-    /// before the caller uploads the image to the GPU; that keeps the
-    /// pixmap and egui's upload staging copy from being resident at
-    /// the same time. Texture creation and reuse are handled by the
-    /// caller so a single GPU texture can be updated in place.
-    fn render_svg(
-        &self,
-        path: &Path,
-        target_w: u32,
-        target_h: u32,
-    ) -> Option<(egui::ColorImage, egui::Vec2)> {
-        let svg_bytes = std::fs::read(path).ok()?;
+    /// Called when the shown plot changes. Results still in flight for
+    /// the previous plot are dropped, and the old image stays up until the
+    /// new one arrives, so paging never flashes an empty window.
+    fn view_changed(&mut self) {
+        self.accept_from = self.next_job_id;
+        self.requested = None;
+        self.last_failed = None;
+    }
 
-        let mut opt = usvg::Options::default();
-        if let Some(dir) = &self.fonts_dir {
-            opt.fontdb_mut().load_fonts_dir(dir);
+    /// Hand a job to the render thread, replacing any job it has not
+    /// started yet. Only the newest request matters.
+    fn submit_job(&mut self, key: RenderKey, preview: Option<(u32, u32)>) {
+        let id = self.next_job_id;
+        self.next_job_id += 1;
+        if let Ok(mut slot) = self.jobs.job.lock() {
+            *slot = Some(RenderJob {
+                id,
+                key: key.clone(),
+                preview,
+            });
         }
-        opt.fontdb_mut().load_system_fonts();
-        opt.font_family = "Liberation Sans".to_string();
+        self.jobs.wake.notify_one();
+        self.requested = Some(key);
+        self.requested_at = Instant::now();
+    }
 
-        let tree = usvg::Tree::from_data(&svg_bytes, &opt).ok()?;
-
-        let svg_size = tree.size();
-        let svg_w = svg_size.width();
-        let svg_h = svg_size.height();
-        if svg_w <= 0.0 || svg_h <= 0.0 {
-            return None;
+    /// Take finished images from the render thread and show the newest one
+    /// that still belongs to the plot on screen. The texture is updated in
+    /// place, so only one GPU texture is ever live.
+    fn receive_results(&mut self, ctx: &egui::Context) {
+        while let Ok(result) = self.results.try_recv() {
+            if result.id < self.accept_from || self.current_path() != Some(&result.key.path) {
+                continue;
+            }
+            let Some((image, rendered_size)) = result.image else {
+                self.last_failed = Some(result.key);
+                continue;
+            };
+            // A quick pass never replaces a sharp image of the same version.
+            let keep_sharp = !result.full_quality
+                && self.displayed.as_ref().map_or(false, |d| {
+                    d.full_quality && d.path == result.key.path && d.mtime == result.key.mtime
+                });
+            if keep_sharp {
+                continue;
+            }
+            match self.texture.as_mut() {
+                Some(texture) => texture.set(image, egui::TextureOptions::LINEAR),
+                None => {
+                    self.texture = Some(ctx.load_texture(
+                        "rustgd-svg",
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+            }
+            self.displayed = Some(Displayed {
+                path: result.key.path,
+                mtime: result.key.mtime,
+                target: result.key.target,
+                full_quality: result.full_quality,
+                rendered_size,
+            });
+            self.last_failed = None;
         }
+    }
+}
 
-        let scale_x = target_w as f32 / svg_w;
-        let scale_y = target_h as f32 / svg_h;
-        let scale = scale_x.min(scale_y);
+/// The render thread. Parses and rasterizes plots away from the window
+/// thread. It sleeps until a job arrives, always takes the newest one, and
+/// sends finished images back over the results channel.
+fn render_thread(
+    jobs: Arc<JobSlot>,
+    results: mpsc::Sender<RenderResult>,
+    ctx: egui::Context,
+    fonts_dir: Option<PathBuf>,
+) {
+    // Load fonts once, here, instead of on every render. Scanning the
+    // system font folders is slow on macOS.
+    let mut opt = usvg::Options::default();
+    if let Some(dir) = &fonts_dir {
+        opt.fontdb_mut().load_fonts_dir(dir);
+    }
+    opt.fontdb_mut().load_system_fonts();
+    opt.font_family = "Liberation Sans".to_string();
 
-        let pixmap_w = (svg_w * scale).max(1.0) as u32;
-        let pixmap_h = (svg_h * scale).max(1.0) as u32;
+    // The last parsed plot. A pure resize of the same file version reuses
+    // it and skips the parse.
+    let mut parsed: Option<(PathBuf, SystemTime, usvg::Tree)> = None;
 
-        // Scope the pixmap so it is dropped at the end of this block,
-        // before the ColorImage is handed back and uploaded. Only the
-        // pixels Vec survives past here.
-        let color_image = {
-            let mut pixmap = Pixmap::new(pixmap_w, pixmap_h)?;
-            let transform = Transform::from_scale(scale, scale);
-            resvg::render(&tree, transform, &mut pixmap.as_mut());
-
-            let pixels: Vec<egui::Color32> = pixmap
-                .pixels()
-                .iter()
-                .map(|p| {
-                    egui::Color32::from_rgba_premultiplied(p.red(), p.green(), p.blue(), p.alpha())
-                })
-                .collect();
-
-            egui::ColorImage {
-                size: [pixmap_w as usize, pixmap_h as usize],
-                pixels,
+    loop {
+        let job = {
+            let Ok(mut slot) = jobs.job.lock() else {
+                return;
+            };
+            loop {
+                if let Some(job) = slot.take() {
+                    break job;
+                }
+                slot = match jobs.wake.wait(slot) {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
             }
         };
 
-        let rendered = egui::Vec2::new(pixmap_w as f32, pixmap_h as f32);
-        Some((color_image, rendered))
+        let reuse = matches!(
+            &parsed,
+            Some((path, mtime, _)) if *path == job.key.path && *mtime == job.key.mtime
+        );
+        if !reuse {
+            // Free the old tree before parsing the next one.
+            parsed = None;
+            let tree = std::fs::read(&job.key.path)
+                .ok()
+                .and_then(|bytes| usvg::Tree::from_data(&bytes, &opt).ok());
+            match tree {
+                Some(tree) => parsed = Some((job.key.path.clone(), job.key.mtime, tree)),
+                None => {
+                    // Missing or half written. When R finishes writing, the
+                    // mtime changes and the window asks again.
+                    let _ = results.send(RenderResult {
+                        id: job.id,
+                        key: job.key,
+                        full_quality: true,
+                        image: None,
+                    });
+                    ctx.request_repaint();
+                    continue;
+                }
+            }
+        }
+        let Some((_, _, tree)) = parsed.as_ref() else {
+            continue;
+        };
+
+        if let Some((w, h)) = job.preview {
+            if let Some(image) = rasterize(tree, w, h) {
+                let _ = results.send(RenderResult {
+                    id: job.id,
+                    key: job.key.clone(),
+                    full_quality: false,
+                    image: Some(image),
+                });
+                ctx.request_repaint();
+            }
+            // If a newer job arrived meanwhile, the sharp pass for this one
+            // would be thrown away, so skip straight to the newer job.
+            if jobs.job.lock().map_or(false, |slot| slot.is_some()) {
+                continue;
+            }
+        }
+
+        let image = rasterize(tree, job.key.target.0, job.key.target.1);
+        let _ = results.send(RenderResult {
+            id: job.id,
+            key: job.key,
+            full_quality: true,
+            image,
+        });
+        ctx.request_repaint();
     }
+}
+
+/// Rasterize a parsed plot to fit inside target_w by target_h pixels and
+/// return it as an egui image plus its pixel size. The tiny-skia pixmap is
+/// freed before returning, so it and the image handed to egui are never
+/// both resident for long.
+fn rasterize(
+    tree: &usvg::Tree,
+    target_w: u32,
+    target_h: u32,
+) -> Option<(egui::ColorImage, egui::Vec2)> {
+    let svg_size = tree.size();
+    let svg_w = svg_size.width();
+    let svg_h = svg_size.height();
+    if svg_w <= 0.0 || svg_h <= 0.0 {
+        return None;
+    }
+
+    let scale_x = target_w as f32 / svg_w;
+    let scale_y = target_h as f32 / svg_h;
+    let scale = scale_x.min(scale_y);
+
+    let pixmap_w = (svg_w * scale).max(1.0) as u32;
+    let pixmap_h = (svg_h * scale).max(1.0) as u32;
+
+    let color_image = {
+        let mut pixmap = Pixmap::new(pixmap_w, pixmap_h)?;
+        let transform = Transform::from_scale(scale, scale);
+        resvg::render(tree, transform, &mut pixmap.as_mut());
+
+        let pixels: Vec<egui::Color32> = pixmap
+            .pixels()
+            .iter()
+            .map(|p| {
+                egui::Color32::from_rgba_premultiplied(p.red(), p.green(), p.blue(), p.alpha())
+            })
+            .collect();
+
+        egui::ColorImage {
+            size: [pixmap_w as usize, pixmap_h as usize],
+            pixels,
+        }
+    };
+
+    let rendered = egui::Vec2::new(pixmap_w as f32, pixmap_h as f32);
+    Some((color_image, rendered))
 }
 
 /// Remove the device background rect (the one rustgd tags with
@@ -702,6 +952,9 @@ impl eframe::App for ViewerApp {
             self.last_poll = Instant::now();
         }
         ctx.request_repaint_after(self.poll_interval);
+
+        // Show any image the render thread has finished.
+        self.receive_results(ctx);
 
         // Keyboard navigation. Sample the input flags before mutating
         // self so we don't hold a borrow on ctx.input across mutations.
@@ -810,6 +1063,7 @@ impl eframe::App for ViewerApp {
         self.show_export_dialog(ctx);
 
         // Main plot area.
+        let mut show_busy_note = false;
         egui::CentralPanel::default().show(ctx, |ui| {
             // Track logical (not physical) size for the resize signal.
             // We send "device units" which are pixels in our viewBox.
@@ -831,7 +1085,9 @@ impl eframe::App for ViewerApp {
                 // gallery (e.g. after Clear all) does not retain the
                 // last rendered buffer.
                 self.texture = None;
-                self.cached = None;
+                self.displayed = None;
+                self.requested = None;
+                self.last_failed = None;
                 ui.centered_and_justified(|ui| {
                     ui.label("no plot yet");
                 });
@@ -839,71 +1095,100 @@ impl eframe::App for ViewerApp {
             };
 
             let pixels_per_point = ctx.pixels_per_point();
-            let target_w = (available.x * pixels_per_point * SUPERSAMPLE).max(1.0) as u32;
-            let target_h = (available.y * pixels_per_point * SUPERSAMPLE).max(1.0) as u32;
+            let target = (
+                (available.x * pixels_per_point * SUPERSAMPLE).max(1.0) as u32,
+                (available.y * pixels_per_point * SUPERSAMPLE).max(1.0) as u32,
+            );
 
-            // Read the file's mtime so we can detect in-place
-            // overwrites (e.g. R re-rendering the same plot at a
-            // new size during a resize).
-            let current_mtime = std::fs::metadata(&current_path)
-                .and_then(|m| m.modified())
-                .ok();
+            // Track how long the plot area has kept its size. While it is
+            // changing, the last image is stretched to fit on the GPU and
+            // nothing is redrawn. A redraw is asked for once it holds still.
+            let now = Instant::now();
+            if target != self.seen_target {
+                self.seen_target = target;
+                self.target_changed_at = now;
+            }
+            if self.settled_target.is_none()
+                || now.duration_since(self.target_changed_at) >= RESIZE_SETTLE
+            {
+                self.settled_target = Some(target);
+            }
+            let settled = self.settled_target.unwrap_or(target);
 
-            let needs_render = match &self.cached {
-                None => true,
-                Some(c) => {
-                    c.svg_path != current_path
-                        || c.target_size != (target_w, target_h)
-                        || current_mtime.map_or(false, |t| t > c.mtime)
-                }
-            };
+            // The file's mtime shows when R has rewritten it in place (for
+            // example a resize replay), and its length says whether it is
+            // heavy enough for a quick first pass.
+            let meta = std::fs::metadata(&current_path).ok();
+            let current_mtime = meta.as_ref().and_then(|m| m.modified().ok());
+            let file_len = meta.as_ref().map_or(0, |m| m.len());
 
-            if needs_render {
-                if let Some((image, rendered)) = self.render_svg(&current_path, target_w, target_h)
-                {
-                    // Update the existing texture in place if we have
-                    // one, otherwise allocate it once. Either way only
-                    // a single GPU texture is ever live. The is_some
-                    // check keeps the borrow of self.texture scoped so
-                    // the else branch can reassign it cleanly.
-                    if self.texture.is_some() {
-                        self.texture
-                            .as_mut()
-                            .unwrap()
-                            .set(image, egui::TextureOptions::LINEAR);
-                    } else {
-                        self.texture = Some(ctx.load_texture(
-                            "rustgd-svg",
-                            image,
-                            egui::TextureOptions::LINEAR,
-                        ));
+            if let Some(mtime) = current_mtime {
+                let key = RenderKey {
+                    path: current_path.clone(),
+                    mtime,
+                    target: settled,
+                };
+                if self.requested.as_ref() != Some(&key) {
+                    let content_changed = self
+                        .requested
+                        .as_ref()
+                        .map_or(true, |r| r.path != key.path || r.mtime != key.mtime);
+                    let heavy = file_len >= PREVIEW_MIN_BYTES;
+                    let wait_for_replay = !content_changed
+                        && heavy
+                        && now.duration_since(self.target_changed_at) < HEAVY_RESIZE_SETTLE;
+                    if !wait_for_replay {
+                        // A new or rewritten heavy file gets a quick pass at
+                        // one pixel per point first. A pure resize does not,
+                        // since the stretched sharp image already looks better.
+                        let preview = if content_changed && heavy {
+                            let scale = pixels_per_point * SUPERSAMPLE;
+                            Some((
+                                (settled.0 as f32 / scale).max(1.0) as u32,
+                                (settled.1 as f32 / scale).max(1.0) as u32,
+                            ))
+                        } else {
+                            None
+                        };
+                        self.submit_job(key, preview);
                     }
-                    self.cached = Some(CachedRender {
-                        svg_path: current_path,
-                        target_size: (target_w, target_h),
-                        rendered_size: rendered,
-                        mtime: current_mtime.unwrap_or(std::time::UNIX_EPOCH),
-                    });
                 }
             }
 
+            let up_to_date = match (&self.displayed, &self.requested) {
+                (Some(d), Some(r)) => {
+                    d.full_quality
+                        && d.path == r.path
+                        && d.mtime == r.mtime
+                        && d.target == r.target
+                }
+                _ => false,
+            };
+            let failed = self.requested.is_some() && self.last_failed == self.requested;
+            let waited = self.requested_at.elapsed() >= BUSY_NOTE_DELAY;
+
             // Pull the values we need for drawing out of the borrowed
-            // cache/texture as Copy values, so the zoom/pan handling
-            // below can take a mutable borrow of self without conflict.
+            // image state and texture as Copy values, so the zoom/pan
+            // handling below can take a mutable borrow of self.
             let draw_data = self
-                .cached
+                .displayed
                 .as_ref()
                 .zip(self.texture.as_ref())
-                .map(|(c, tex)| (c.rendered_size, tex.id()));
+                .map(|(d, tex)| (d.rendered_size, tex.id()));
 
             if let Some((rendered_size, tex_id)) = draw_data {
-                let pixels_per_point = ctx.pixels_per_point();
-                // rendered_size is in supersampled physical pixels.
-                // Dividing by both pixels_per_point and SUPERSAMPLE
-                // gives back the logical fit size. egui's Linear
-                // texture filter does the downsample (and any zoom
-                // upscale) on the GPU.
-                let fit_size = rendered_size / (pixels_per_point * SUPERSAMPLE);
+                show_busy_note = !up_to_date && !failed && waited;
+
+                // Fit the image inside the plot area at its own aspect
+                // ratio. egui's Linear texture filter does the scaling on
+                // the GPU, which is also what stretches a stale image
+                // smoothly while a resize settles.
+                let aspect = rendered_size.x.max(1.0) / rendered_size.y.max(1.0);
+                let fit_size = if area.width() > area.height() * aspect {
+                    egui::vec2(area.height() * aspect, area.height())
+                } else {
+                    egui::vec2(area.width(), area.width() / aspect)
+                };
 
                 // Off zoom mode means always fit: force zoom/pan back
                 // so toggling off snaps to the clean view.
@@ -980,11 +1265,29 @@ impl eframe::App for ViewerApp {
                         egui::CursorIcon::Grab
                     });
                 }
-            } else {
+            } else if waited {
+                let note = if failed {
+                    "failed to render SVG"
+                } else {
+                    "rendering\u{2026}"
+                };
                 ui.centered_and_justified(|ui| {
-                    ui.label("failed to render SVG");
+                    ui.label(note);
                 });
             }
         });
+
+        // A small note in the corner while a slow render is in progress.
+        if show_busy_note {
+            egui::Area::new(egui::Id::new("rustgd_busy_note"))
+                .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-12.0, -12.0))
+                .order(egui::Order::Foreground)
+                .interactable(false)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.label("Rendering\u{2026}");
+                    });
+                });
+        }
     }
 }

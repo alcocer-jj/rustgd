@@ -64,6 +64,11 @@ static REPLAY_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 /// page during multi-plot history replay.
 static CURRENT_PAGE: AtomicUsize = AtomicUsize::new(0);
 
+/// Set when the device reopened a closed window and cleared the old
+/// plots. R reads and resets it after each command and drops its plot
+/// history to match.
+static GALLERY_RESET: AtomicBool = AtomicBool::new(false);
+
 // ----------------------------------------------------------------------
 // libc bindings
 // ----------------------------------------------------------------------
@@ -532,7 +537,11 @@ impl DrawBuffer {
 
 struct RustgdDevice {
     dir: PathBuf,
-    _viewer_child: std::process::Child,
+    /// The viewer binary and fonts folder, kept so the window can be
+    /// reopened if it is closed before R notices.
+    viewer_bin: PathBuf,
+    fonts_dir: PathBuf,
+    viewer_child: std::process::Child,
     buffer: DrawBuffer,
     font_bytes: [[Vec<u8>; NUM_FACES]; NUM_FAMILIES],
 }
@@ -564,7 +573,7 @@ impl RustgdDevice {
             }
         }
 
-        let child = Command::new(viewer)
+        let child = Command::new(&viewer)
             .arg(&dir)
             .arg(&fonts_dir)
             .spawn()
@@ -572,10 +581,50 @@ impl RustgdDevice {
 
         Ok(Self {
             dir,
-            _viewer_child: child,
+            viewer_bin: viewer,
+            fonts_dir,
+            viewer_child: child,
             buffer: DrawBuffer::new(),
             font_bytes,
         })
+    }
+
+    /// Reopen the viewer if its window has been closed but R has not yet
+    /// retired the device. That happens when a plot is sent while R is
+    /// still busy, before the idle-time poll sees the close. Without this
+    /// the plot would be drawn into a device whose window is gone.
+    ///
+    /// Closing the window means starting over, the same as when R notices
+    /// the close itself. So the old plots are deleted, the page count goes
+    /// back to zero, and R is told to drop its plot history.
+    fn ensure_viewer(&mut self) {
+        if let Ok(Some(_)) = self.viewer_child.try_wait() {
+            if let Ok(entries) = fs::read_dir(&self.dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with("plot-") && name.ends_with(".svg") {
+                        let _ = fs::remove_file(entry.path());
+                    }
+                }
+            }
+            // Clear the signals the closed window left behind. The close
+            // marker would make the R-side poll shut the device down under
+            // the new window, and an unread clear request would delete the
+            // plot that is about to be drawn.
+            for name in ["viewer_closed", "resize.txt", "clear_plot.txt", "clear_all.txt"] {
+                let _ = fs::remove_file(self.dir.join(name));
+            }
+            CURRENT_PAGE.store(0, Ordering::SeqCst);
+            GALLERY_RESET.store(true, Ordering::SeqCst);
+            if let Ok(child) = Command::new(&self.viewer_bin)
+                .arg(&self.dir)
+                .arg(&self.fonts_dir)
+                .spawn()
+            {
+                self.viewer_child = child;
+            }
+        }
     }
 
     fn flush(&mut self) {
@@ -688,6 +737,8 @@ impl RustgdDevice {
         // replay to overwrite the existing page's file rather than
         // create a new entry.
         if !REPLAY_IN_PROGRESS.load(Ordering::SeqCst) {
+            // A user-issued plot. Make sure it has a window to land in.
+            self.ensure_viewer();
             CURRENT_PAGE.fetch_add(1, Ordering::SeqCst);
         }
         NEW_PAGE_FIRED.store(true, Ordering::SeqCst);
@@ -1444,6 +1495,7 @@ fn rustgd_activate(session_dir: &str) {
     DREW_SOMETHING.store(false, Ordering::SeqCst);
     REPLAY_IN_PROGRESS.store(false, Ordering::SeqCst);
     CURRENT_PAGE.store(0, Ordering::SeqCst);
+    GALLERY_RESET.store(false, Ordering::SeqCst);
 
     // Construct the Rust device. On success, transfer ownership to a
     // raw pointer that the C side will store in dd->deviceSpecific.
@@ -1513,6 +1565,13 @@ fn rustgd_set_current_page(page: i32) {
     CURRENT_PAGE.store(n, Ordering::SeqCst);
 }
 
+// True once after the device reopened a closed window and cleared the old
+// plots. The R side then drops its plot history to match.
+#[extendr]
+fn rustgd_take_gallery_reset() -> bool {
+    GALLERY_RESET.swap(false, Ordering::SeqCst)
+}
+
 extendr_module! {
     mod rustgd;
     fn rustgd_activate;
@@ -1521,4 +1580,5 @@ extendr_module! {
     fn rustgd_check_drew;
     fn rustgd_set_replay_mode;
     fn rustgd_set_current_page;
+    fn rustgd_take_gallery_reset;
 }

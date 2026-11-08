@@ -29,6 +29,14 @@ rustgd <- function() {
     tryCatch(dev.off(prev_dev), error = function(e) NULL)
   }
 
+  # Stop the poll chain of any earlier device so two chains never run
+  # side by side.
+  cancel_poll <- .rustgd_state$poll_cancel
+  .rustgd_state$poll_cancel <- NULL
+  if (is.function(cancel_poll)) {
+    tryCatch(cancel_poll(), error = function(e) NULL)
+  }
+
   # Remove any stale resize-capture callback before re-registering.
   callbacks <- getTaskCallbackNames()
   if ("rustgd_resize_capture" %in% callbacks) {
@@ -65,10 +73,13 @@ rustgd <- function() {
   )
 
   # Task callback captures plot expressions after each user command.
+  # It returns FALSE once the device has been retired, which tells R to
+  # remove it. That is safe on every R version, unlike removing a
+  # callback from inside itself.
   addTaskCallback(
     function(expr, value, ok, visible) {
       tryCatch(rustgd_task_callback(expr), error = function(e) NULL)
-      TRUE
+      isTRUE(.rustgd_state$active)
     },
     name = "rustgd_resize_capture"
   )
@@ -79,7 +90,7 @@ rustgd <- function() {
     warning("Package 'later' is required for automatic resize reflow. Install it with install.packages('later').")
     return(invisible(NULL))
   }
-  later::later(rustgd_poll_resize, delay = 0.005)
+  .rustgd_state$poll_cancel <- later::later(rustgd_poll_resize, delay = 0.005)
 
   invisible(NULL)
 }
@@ -101,13 +112,22 @@ rustgd <- function() {
 .rustgd_state$device_num <- NULL
 .rustgd_state$session_dir <- NULL
 .rustgd_state$prev_device <- NULL
+# Cancels the next scheduled poll. later::later() returns it.
+.rustgd_state$poll_cancel <- NULL
 
 #' Internal: tear down the rustgd session. Removes the task callback,
 #' clears state, and optionally closes the R device. Idempotent;
 #' safe to call from poll handlers that may race with manual dev.off().
 #' @noRd
-rustgd_shutdown <- function(close_device = TRUE) {
+rustgd_shutdown <- function(close_device = TRUE, remove_callback = TRUE) {
   .rustgd_state$active <- FALSE
+
+  # Cancel the next scheduled poll so nothing outlives the device.
+  cancel_poll <- .rustgd_state$poll_cancel
+  .rustgd_state$poll_cancel <- NULL
+  if (is.function(cancel_poll)) {
+    tryCatch(cancel_poll(), error = function(e) NULL)
+  }
 
   if (close_device) {
     dev_num <- .rustgd_state$device_num
@@ -116,9 +136,13 @@ rustgd_shutdown <- function(close_device = TRUE) {
     }
   }
 
-  callbacks <- getTaskCallbackNames()
-  if ("rustgd_resize_capture" %in% callbacks) {
-    tryCatch(removeTaskCallback("rustgd_resize_capture"), error = function(e) NULL)
+  # The task callback itself passes remove_callback = FALSE. It then
+  # returns FALSE and R removes it once it has finished running.
+  if (remove_callback) {
+    callbacks <- getTaskCallbackNames()
+    if ("rustgd_resize_capture" %in% callbacks) {
+      tryCatch(removeTaskCallback("rustgd_resize_capture"), error = function(e) NULL)
+    }
   }
 
   .rustgd_state$plot_history <- list()
@@ -132,6 +156,11 @@ rustgd_poll_resize <- function() {
   if (!isTRUE(.rustgd_state$active)) {
     return(invisible(NULL))
   }
+
+  # Schedule the next poll before doing any work. If anything below is
+  # interrupted (Ctrl+C during a long replay) or fails, the chain still
+  # carries on, so resize, Clear plot, and window close keep working.
+  .rustgd_state$poll_cancel <- later::later(rustgd_poll_resize, delay = 0.005)
 
   # If the device was closed externally (e.g. user called dev.off()
   # manually, or graphics.off()), stop polling.
@@ -156,19 +185,32 @@ rustgd_poll_resize <- function() {
     # Clear-all signal: wipe history and all SVG files.
     clear_all_marker <- file.path(session_dir, "clear_all.txt")
     if (file.exists(clear_all_marker)) {
-      tryCatch(rustgd_handle_clear_all(), error = function(e) NULL)
+      tryCatch(
+        rustgd_handle_clear_all(),
+        error = function(e) NULL,
+        interrupt = function(e) NULL
+      )
     }
 
     # Clear-active signal: remove the specified plot from history
     # and renumber remaining files so the gallery stays contiguous.
     clear_plot_marker <- file.path(session_dir, "clear_plot.txt")
     if (file.exists(clear_plot_marker)) {
-      tryCatch(rustgd_handle_clear_plot(), error = function(e) NULL)
+      tryCatch(
+        rustgd_handle_clear_plot(),
+        error = function(e) NULL,
+        interrupt = function(e) NULL
+      )
     }
   }
 
-  tryCatch(rustgd_input_handler(), error = function(e) NULL)
-  later::later(rustgd_poll_resize, delay = 0.005)
+  # Interrupts are caught as well as errors. Ctrl+C during a long
+  # replay stops that replay and hands the console back.
+  tryCatch(
+    rustgd_input_handler(),
+    error = function(e) NULL,
+    interrupt = function(e) NULL
+  )
   invisible(NULL)
 }
 
@@ -308,6 +350,23 @@ rustgd_input_handler <- function() {
 #' replayPlot throws at replay time.
 #' @noRd
 rustgd_task_callback <- function(expr) {
+  # Catch a window close the poll missed, for example one made while a
+  # long replay was running. Retiring the device here means the next
+  # plot opens a fresh window instead of drawing into a closed one.
+  session_dir <- .rustgd_state$session_dir
+  if (isTRUE(.rustgd_state$active) && !is.null(session_dir) &&
+    file.exists(file.path(session_dir, "viewer_closed"))) {
+    rustgd_shutdown(close_device = TRUE, remove_callback = FALSE)
+    return(invisible(NULL))
+  }
+
+  # If a plot arrived after the window was closed but before R noticed,
+  # the device reopened the window and deleted the old plots. Drop the
+  # matching history so closing the window always starts over.
+  if (rustgd_take_gallery_reset()) {
+    .rustgd_state$plot_history <- list()
+  }
+
   if (rustgd_check_new_page()) {
     recorded <- .rustgd_record_current()
     .rustgd_state$plot_history <- c(

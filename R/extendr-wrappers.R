@@ -17,4 +17,6 @@ rustgd_set_replay_mode <- function(on) .Call(wrap__rustgd_set_replay_mode, on)
 
 rustgd_set_current_page <- function(page) .Call(wrap__rustgd_set_current_page, page)
 
+rustgd_take_gallery_reset <- function() .Call(wrap__rustgd_take_gallery_reset)
+
 # nolint end
