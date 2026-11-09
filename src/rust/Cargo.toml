@@ -55,6 +55,9 @@ egui = "0.29"
 # notify is declared per-platform below; its backend differs by OS.
 resvg = "0.43"
 usvg = "0.43"
+# Already in the build through usvg. The .rgd renderer builds circles from
+# kurbo arcs exactly as usvg does, so both paths draw identical circles.
+kurbo = "0.11"
 tiny-skia = "0.11"
 ttf-parser = "0.25"
 rfd = "0.14"

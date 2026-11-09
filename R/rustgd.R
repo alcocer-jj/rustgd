@@ -58,15 +58,20 @@ rustgd <- function() {
   .rustgd_state$active <- TRUE
   .rustgd_state$session_dir <- file.path(tempdir(), paste0("rustgd-", Sys.getpid()))
 
-  # How the device writes its pages. "binary" also writes each page's
-  # display list as a .rgd file next to its SVG. This switch is temporary
-  # and goes away once the viewer draws .rgd pages itself.
+  # How the device writes its pages. "binary" writes each page's display
+  # list as a .rgd file, which the viewer draws directly. With
+  # options(rustgd.debug_svg = TRUE) it also writes the SVG, and the
+  # viewer can flip between drawing either one. Both switches are
+  # temporary and go away once binary is the only way pages are written.
   transport <- getOption("rustgd.transport", "svg")
   if (!identical(transport, "svg") && !identical(transport, "binary")) {
     warning("options(rustgd.transport) must be \"svg\" or \"binary\". Using \"svg\".")
     transport <- "svg"
   }
-  rustgd_set_transport(identical(transport, "binary"))
+  rustgd_set_transport(
+    identical(transport, "binary"),
+    isTRUE(getOption("rustgd.debug_svg", FALSE))
+  )
 
   rustgd_activate(.rustgd_state$session_dir)
   .rustgd_state$device_num <- dev.cur()
@@ -590,9 +595,10 @@ rustgd_handle_clear_all <- function() {
 }
 
 #' Internal. Checks every page written with options(rustgd.transport =
-#' "binary"). Each .rgd file is decoded and turned back into SVG, which
-#' must match the .svg written beside it byte for byte. Prints a summary
-#' and returns the pages that differ.
+#' "binary") and options(rustgd.debug_svg = TRUE). Each .rgd file is
+#' decoded and turned back into SVG, which must match the .svg written
+#' beside it byte for byte. Prints a summary and returns the pages that
+#' differ.
 #' @noRd
 .rustgd_check_binary <- function() {
   session_dir <- .rustgd_state$session_dir
@@ -601,6 +607,13 @@ rustgd_handle_clear_all <- function() {
     return(invisible(integer(0)))
   }
   result <- rustgd_binary_check(session_dir)
+  if (result$checked == 0) {
+    message(
+      "No page has both an .rgd and an .svg to compare. Set ",
+      "options(rustgd.debug_svg = TRUE) before the first plot to write both."
+    )
+    return(invisible(integer(0)))
+  }
   bad <- result$mismatched
   message(sprintf(
     "Checked %d .rgd pages. %d differ from their .svg.",

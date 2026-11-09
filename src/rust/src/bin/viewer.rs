@@ -1,5 +1,7 @@
 //! rustgd-viewer, the standalone window the device's R side launches.
-//! Watches a directory passed as argv[1] and displays the SVG plots in it.
+//! Watches a directory passed as argv[1] and displays the plots in it.
+//! A page arrives as an SVG file or as a .rgd display list, which is drawn
+//! directly without parsing anything.
 //! Loads a bundled fonts directory from argv[2]. Liberation Sans is
 //! registered as egui's primary font so the toolbar's arrows render
 //! correctly and the UI typography matches the SVG plot typography.
@@ -21,7 +23,7 @@
 //! signal file into the watch directory so the R-side poller
 //! can call `dev.off()` and clean up the session.
 //!
-//! Gallery view. All SVG files in the watch directory are sorted
+//! Gallery view. All pages in the watch directory are sorted
 //! ascending and navigable with prev/next buttons in the top toolbar,
 //! or with the Left/Right/Home/End keys. When a new plot arrives, the
 //! view auto-jumps to it. A changed file modification time (an in-place
@@ -38,6 +40,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui;
 use tiny_skia::{Pixmap, Transform};
+
+// The display list format and its renderer, shared with the device.
+#[allow(dead_code)]
+#[path = "../display_list.rs"]
+mod display_list;
+#[path = "../rgd_render.rs"]
+mod rgd_render;
 
 /// On-screen supersampling factor. The viewer rasterizes each SVG into a
 /// pixmap this many times larger than the displayed area in each
@@ -64,6 +73,11 @@ const HEAVY_RESIZE_SETTLE: Duration = Duration::from_millis(1500);
 /// the full one, so a heavy plot shows up right away. Setting it to
 /// u64::MAX turns the quick pass off.
 const PREVIEW_MIN_BYTES: u64 = 2_000_000;
+
+/// The same for .rgd pages. They draw several times faster than the SVG
+/// of the same plot, since nothing has to be parsed, so they count as
+/// heavy only from a much larger size.
+const PREVIEW_MIN_BYTES_RGD: u64 = 24_000_000;
 
 /// How long a render may run before the "Rendering" note appears, so
 /// fast plots never flash it.
@@ -145,12 +159,15 @@ fn setup_egui_fonts(ctx: &egui::Context, fonts_dir: Option<&Path>) {
 struct ViewerApp {
     watch_dir: PathBuf,
     fonts_dir: Option<PathBuf>,
-    /// All SVG files in the watch directory, sorted ascending by path.
-    /// The last entry is the most recent plot.
-    svg_paths: Vec<PathBuf>,
-    /// Index into `svg_paths` of the plot currently displayed. Valid
-    /// only when `svg_paths` is non-empty.
+    /// The pages in the watch directory, in page order. The last entry is
+    /// the most recent plot.
+    pages: Vec<PageFiles>,
+    /// Index into `pages` of the plot currently displayed. Valid only
+    /// when `pages` is non-empty.
     current_index: usize,
+    /// Draw a page from its SVG even when its .rgd exists. Only matters
+    /// with options(rustgd.debug_svg = TRUE), which writes both.
+    show_svg: bool,
     /// What the texture currently holds. None until the first image
     /// arrives from the render thread.
     displayed: Option<Displayed>,
@@ -221,6 +238,18 @@ struct ViewerApp {
     pan: egui::Vec2,
 }
 
+/// The files R has written for one page. A page has an .svg, an .rgd, or
+/// both when the SVG debug option is on.
+#[derive(Clone, PartialEq)]
+struct PageFiles {
+    svg: Option<PathBuf>,
+    rgd: Option<PathBuf>,
+}
+
+fn is_rgd(path: &Path) -> bool {
+    path.extension().map_or(false, |e| e == "rgd")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExportFormat {
     Png,
@@ -236,6 +265,8 @@ struct Displayed {
     full_quality: bool,
     /// Pixel size of the image. Drawing only uses its aspect ratio.
     rendered_size: egui::Vec2,
+    /// How long the render thread took to read and draw it.
+    took: Duration,
 }
 
 /// One render request. A file version (path plus mtime) at a raster size.
@@ -260,6 +291,7 @@ struct RenderResult {
     full_quality: bool,
     /// None when the file could not be read or parsed.
     image: Option<(egui::ColorImage, egui::Vec2)>,
+    took: Duration,
 }
 
 /// Holds at most one waiting job. Sending a new one replaces it.
@@ -286,8 +318,9 @@ impl ViewerApp {
         Self {
             watch_dir,
             fonts_dir,
-            svg_paths: Vec::new(),
+            pages: Vec::new(),
             current_index: 0,
+            show_svg: false,
             displayed: None,
             texture: None,
             jobs,
@@ -328,18 +361,44 @@ impl ViewerApp {
             Err(_) => return,
         };
 
-        let mut new_paths: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().map(|x| x == "svg").unwrap_or(false))
-            .collect();
-        new_paths.sort();
+        // R writes each page as plot-NNNN.svg, plot-NNNN.rgd, or both.
+        let mut by_page: std::collections::BTreeMap<u32, PageFiles> =
+            std::collections::BTreeMap::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(rest) = name.strip_prefix("plot-") else {
+                continue;
+            };
+            let (number, rgd) = if let Some(n) = rest.strip_suffix(".svg") {
+                (n, false)
+            } else if let Some(n) = rest.strip_suffix(".rgd") {
+                (n, true)
+            } else {
+                continue;
+            };
+            let Ok(page) = number.parse::<u32>() else {
+                continue;
+            };
+            let files = by_page.entry(page).or_insert(PageFiles {
+                svg: None,
+                rgd: None,
+            });
+            if rgd {
+                files.rgd = Some(path);
+            } else {
+                files.svg = Some(path);
+            }
+        }
+        let new_pages: Vec<PageFiles> = by_page.into_values().collect();
 
-        if new_paths != self.svg_paths {
+        if new_pages != self.pages {
             // Auto-jump to the latest plot whenever the file list
-            // changes — matches the R console and httpgd behavior.
-            self.svg_paths = new_paths;
-            self.current_index = self.svg_paths.len().saturating_sub(1);
+            // changes, which matches the R console and httpgd behavior.
+            self.pages = new_pages;
+            self.current_index = self.pages.len().saturating_sub(1);
             self.view_changed();
             self.reset_zoom();
         }
@@ -354,7 +413,7 @@ impl ViewerApp {
     }
 
     fn next(&mut self) {
-        if self.current_index + 1 < self.svg_paths.len() {
+        if self.current_index + 1 < self.pages.len() {
             self.current_index += 1;
             self.view_changed();
             self.reset_zoom();
@@ -362,7 +421,7 @@ impl ViewerApp {
     }
 
     fn goto_first(&mut self) {
-        if !self.svg_paths.is_empty() && self.current_index != 0 {
+        if !self.pages.is_empty() && self.current_index != 0 {
             self.current_index = 0;
             self.view_changed();
             self.reset_zoom();
@@ -370,16 +429,30 @@ impl ViewerApp {
     }
 
     fn goto_latest(&mut self) {
-        let last = self.svg_paths.len().saturating_sub(1);
-        if !self.svg_paths.is_empty() && self.current_index != last {
+        let last = self.pages.len().saturating_sub(1);
+        if !self.pages.is_empty() && self.current_index != last {
             self.current_index = last;
             self.view_changed();
             self.reset_zoom();
         }
     }
 
+    /// The file the plot on screen is drawn from. A page's .rgd is used
+    /// when it has one, unless the SVG toggle asks for its SVG.
     fn current_path(&self) -> Option<&PathBuf> {
-        self.svg_paths.get(self.current_index)
+        let page = self.pages.get(self.current_index)?;
+        if self.show_svg {
+            page.svg.as_ref().or(page.rgd.as_ref())
+        } else {
+            page.rgd.as_ref().or(page.svg.as_ref())
+        }
+    }
+
+    /// Whether the plot on screen has both an .svg and an .rgd.
+    fn current_has_both(&self) -> bool {
+        self.pages
+            .get(self.current_index)
+            .map_or(false, |p| p.svg.is_some() && p.rgd.is_some())
     }
 
     /// Page number of the plot on screen, read from its file name. R keys
@@ -407,7 +480,7 @@ impl ViewerApp {
     }
 
     /// Write a clear-all marker file. The R-side poller picks it up,
-    /// empties plot_history, deletes every plot-*.svg, and resets the
+    /// empties plot_history, deletes every page file, and resets the
     /// page counter. The viewer's directory poll then sees the empty
     /// dir and shows "no plots".
     fn signal_clear_all(&self) {
@@ -566,7 +639,7 @@ impl ViewerApp {
     /// Errors are silently swallowed for now — there's no UI surface
     /// for them. If the user cancels the file picker, nothing happens.
     fn run_export(&self) {
-        let Some(source_svg) = self.current_path().cloned() else {
+        let Some(source) = self.current_path().cloned() else {
             return;
         };
 
@@ -590,36 +663,55 @@ impl ViewerApp {
         }
 
         match self.export_format {
+            ExportFormat::Svg if is_rgd(&source) => {
+                // A binary page has no SVG file, so build it with the same
+                // writer the device uses for its SVG pages.
+                let svg = std::fs::read(&source)
+                    .ok()
+                    .and_then(|bytes| display_list::file_to_svg(&bytes).ok());
+                if let Some(svg) = svg {
+                    let svg = if self.export_transparent {
+                        strip_background_rect(&svg)
+                    } else {
+                        svg
+                    };
+                    let _ = std::fs::write(&dest, svg);
+                }
+            }
             ExportFormat::Svg => {
+                let source_svg = &source;
                 if self.export_transparent {
                     // Strip the device background rect and write the
                     // modified SVG. Fall back to a plain copy if the
                     // file cannot be read as text for any reason.
-                    match std::fs::read_to_string(&source_svg) {
+                    match std::fs::read_to_string(source_svg) {
                         Ok(s) => {
                             let _ = std::fs::write(&dest, strip_background_rect(&s));
                         }
                         Err(_) => {
-                            let _ = std::fs::copy(&source_svg, &dest);
+                            let _ = std::fs::copy(source_svg, &dest);
                         }
                     }
                 } else {
-                    let _ = std::fs::copy(&source_svg, &dest);
+                    let _ = std::fs::copy(source_svg, &dest);
                 }
             }
             ExportFormat::Png => {
-                let _ = self.export_as_png(&source_svg, &dest);
+                let _ = self.export_as_png(&source, &dest);
             }
         }
     }
 
-    /// Rasterize the given SVG file at `export_width_in × export_height_in`
+    /// Rasterize the given page at `export_width_in × export_height_in`
     /// inches at `export_dpi` and write a PNG. Aspect ratio is preserved
     /// (the rendered image fits within the chosen bounding box). The
     /// PNG file is tagged with the chosen DPI in its pHYs metadata
     /// chunk so print software handles it at the intended resolution.
-    fn export_as_png(&self, source_svg: &Path, dest: &Path) -> Result<(), String> {
-        let svg_string = std::fs::read_to_string(source_svg).map_err(|e| e.to_string())?;
+    fn export_as_png(&self, source: &Path, dest: &Path) -> Result<(), String> {
+        if is_rgd(source) {
+            return self.export_rgd_as_png(source, dest);
+        }
+        let svg_string = std::fs::read_to_string(source).map_err(|e| e.to_string())?;
         // When exporting transparent, drop the device background rect
         // so the pixmap (which starts fully transparent) shows through.
         let svg_string = if self.export_transparent {
@@ -661,6 +753,42 @@ impl ViewerApp {
         let transform = Transform::from_scale(scale, scale);
         resvg::render(&tree, transform, &mut pixmap.as_mut());
 
+        write_png_with_dpi(&pixmap, dest, self.export_dpi)
+    }
+
+    /// The PNG export for a .rgd page, drawn by the same renderer as the
+    /// window and sized the same way as the SVG export above.
+    fn export_rgd_as_png(&self, source: &Path, dest: &Path) -> Result<(), String> {
+        let bytes = std::fs::read(source).map_err(|e| e.to_string())?;
+        let page = rgd_render::Page::new(bytes).map_err(|e| format!("read page: {e:?}"))?;
+        if page.width <= 0.0 || page.height <= 0.0 {
+            return Err("page has zero size".to_string());
+        }
+
+        let mut opt = usvg::Options::default();
+        if let Some(dir) = &self.fonts_dir {
+            opt.fontdb_mut().load_fonts_dir(dir);
+        }
+        opt.fontdb_mut().load_system_fonts();
+        opt.font_family = "Liberation Sans".to_string();
+
+        let target_w = (self.export_width_in * self.export_dpi as f32).max(1.0);
+        let target_h = (self.export_height_in * self.export_dpi as f32).max(1.0);
+        let scale = (target_w / page.width).min(target_h / page.height);
+        let pixmap_w = (page.width * scale).max(1.0) as u32;
+        let pixmap_h = (page.height * scale).max(1.0) as u32;
+
+        let mut pixmap = Pixmap::new(pixmap_w, pixmap_h)
+            .ok_or_else(|| "failed to allocate pixmap".to_string())?;
+        let mut texts = rgd_render::TextCache::new();
+        rgd_render::draw(
+            &page,
+            &mut pixmap,
+            scale,
+            self.export_transparent,
+            &opt,
+            &mut texts,
+        );
         write_png_with_dpi(&pixmap, dest, self.export_dpi)
     }
 
@@ -773,10 +901,17 @@ impl ViewerApp {
                 target: result.key.target,
                 full_quality: result.full_quality,
                 rendered_size,
+                took: result.took,
             });
             self.last_failed = None;
         }
     }
+}
+
+/// A plot file read into memory, ready to rasterize at any size.
+enum Parsed {
+    Svg(usvg::Tree),
+    Rgd(rgd_render::Page),
 }
 
 /// The render thread. Parses and rasterizes plots away from the window
@@ -797,9 +932,12 @@ fn render_thread(
     opt.fontdb_mut().load_system_fonts();
     opt.font_family = "Liberation Sans".to_string();
 
+    // Label layouts for .rgd pages, kept across pages and redraws.
+    let mut texts = rgd_render::TextCache::new();
+
     // The last parsed plot. A pure resize of the same file version reuses
     // it and skips the parse.
-    let mut parsed: Option<(PathBuf, SystemTime, usvg::Tree)> = None;
+    let mut parsed: Option<(PathBuf, SystemTime, Parsed)> = None;
 
     loop {
         let job = {
@@ -817,6 +955,7 @@ fn render_thread(
             }
         };
 
+        let started = Instant::now();
         let reuse = matches!(
             &parsed,
             Some((path, mtime, _)) if *path == job.key.path && *mtime == job.key.mtime
@@ -824,11 +963,15 @@ fn render_thread(
         if !reuse {
             // Free the old tree before parsing the next one.
             parsed = None;
-            let tree = std::fs::read(&job.key.path)
-                .ok()
-                .and_then(|bytes| usvg::Tree::from_data(&bytes, &opt).ok());
-            match tree {
-                Some(tree) => parsed = Some((job.key.path.clone(), job.key.mtime, tree)),
+            let loaded = std::fs::read(&job.key.path).ok().and_then(|bytes| {
+                if is_rgd(&job.key.path) {
+                    rgd_render::Page::new(bytes).ok().map(Parsed::Rgd)
+                } else {
+                    usvg::Tree::from_data(&bytes, &opt).ok().map(Parsed::Svg)
+                }
+            });
+            match loaded {
+                Some(page) => parsed = Some((job.key.path.clone(), job.key.mtime, page)),
                 None => {
                     // Missing or half written. When R finishes writing, the
                     // mtime changes and the window asks again.
@@ -837,23 +980,25 @@ fn render_thread(
                         key: job.key,
                         full_quality: true,
                         image: None,
+                        took: started.elapsed(),
                     });
                     ctx.request_repaint();
                     continue;
                 }
             }
         }
-        let Some((_, _, tree)) = parsed.as_ref() else {
+        let Some((_, _, page)) = parsed.as_ref() else {
             continue;
         };
 
         if let Some((w, h)) = job.preview {
-            if let Some(image) = rasterize(tree, w, h) {
+            if let Some(image) = rasterize(page, w, h, &opt, &mut texts) {
                 let _ = results.send(RenderResult {
                     id: job.id,
                     key: job.key.clone(),
                     full_quality: false,
                     image: Some(image),
+                    took: started.elapsed(),
                 });
                 ctx.request_repaint();
             }
@@ -864,26 +1009,53 @@ fn render_thread(
             }
         }
 
-        let image = rasterize(tree, job.key.target.0, job.key.target.1);
+        let image = rasterize(page, job.key.target.0, job.key.target.1, &opt, &mut texts);
         let _ = results.send(RenderResult {
             id: job.id,
             key: job.key,
             full_quality: true,
             image,
+            took: started.elapsed(),
         });
         ctx.request_repaint();
     }
 }
 
-/// Rasterize a parsed plot to fit inside target_w by target_h pixels and
-/// return it as an egui image plus its pixel size. The tiny-skia pixmap is
-/// freed before returning, so it and the image handed to egui are never
-/// both resident for long.
+/// Rasterize a plot to fit inside target_w by target_h pixels and return
+/// it as an egui image plus its pixel size. The tiny-skia pixmap is freed
+/// before returning, so it and the image handed to egui are never both
+/// resident for long.
 fn rasterize(
-    tree: &usvg::Tree,
+    page: &Parsed,
     target_w: u32,
     target_h: u32,
+    opt: &usvg::Options,
+    texts: &mut rgd_render::TextCache,
 ) -> Option<(egui::ColorImage, egui::Vec2)> {
+    let pixmap = match page {
+        Parsed::Svg(tree) => rasterize_svg(tree, target_w, target_h)?,
+        Parsed::Rgd(page) => rgd_render::render_fit(page, target_w, target_h, opt, texts)?,
+    };
+    let rendered = egui::Vec2::new(pixmap.width() as f32, pixmap.height() as f32);
+    let color_image = {
+        let pixels: Vec<egui::Color32> = pixmap
+            .pixels()
+            .iter()
+            .map(|p| {
+                egui::Color32::from_rgba_premultiplied(p.red(), p.green(), p.blue(), p.alpha())
+            })
+            .collect();
+        egui::ColorImage {
+            size: [pixmap.width() as usize, pixmap.height() as usize],
+            pixels,
+        }
+    };
+    drop(pixmap);
+    Some((color_image, rendered))
+}
+
+/// Draw a parsed SVG to fit inside target_w by target_h pixels.
+fn rasterize_svg(tree: &usvg::Tree, target_w: u32, target_h: u32) -> Option<Pixmap> {
     let svg_size = tree.size();
     let svg_w = svg_size.width();
     let svg_h = svg_size.height();
@@ -898,27 +1070,10 @@ fn rasterize(
     let pixmap_w = (svg_w * scale).max(1.0) as u32;
     let pixmap_h = (svg_h * scale).max(1.0) as u32;
 
-    let color_image = {
-        let mut pixmap = Pixmap::new(pixmap_w, pixmap_h)?;
-        let transform = Transform::from_scale(scale, scale);
-        resvg::render(tree, transform, &mut pixmap.as_mut());
-
-        let pixels: Vec<egui::Color32> = pixmap
-            .pixels()
-            .iter()
-            .map(|p| {
-                egui::Color32::from_rgba_premultiplied(p.red(), p.green(), p.blue(), p.alpha())
-            })
-            .collect();
-
-        egui::ColorImage {
-            size: [pixmap_w as usize, pixmap_h as usize],
-            pixels,
-        }
-    };
-
-    let rendered = egui::Vec2::new(pixmap_w as f32, pixmap_h as f32);
-    Some((color_image, rendered))
+    let mut pixmap = Pixmap::new(pixmap_w, pixmap_h)?;
+    let transform = Transform::from_scale(scale, scale);
+    resvg::render(tree, transform, &mut pixmap.as_mut());
+    Some(pixmap)
 }
 
 /// Remove the device background rect (the one rustgd tags with
@@ -994,6 +1149,8 @@ impl eframe::App for ViewerApp {
         let go_next = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
         let go_first = ctx.input(|i| i.key_pressed(egui::Key::Home));
         let go_last = ctx.input(|i| i.key_pressed(egui::Key::End));
+        let flip_renderer =
+            !self.export_dialog_open && ctx.input(|i| i.key_pressed(egui::Key::S));
         if go_prev {
             self.prev();
         }
@@ -1006,6 +1163,9 @@ impl eframe::App for ViewerApp {
         if go_last {
             self.goto_latest();
         }
+        if flip_renderer && self.current_has_both() {
+            self.show_svg = !self.show_svg;
+        }
 
         // Top toolbar: prev / next / counter on the left, action
         // buttons (Export, Clear plot, Clear all) on the right.
@@ -1013,9 +1173,9 @@ impl eframe::App for ViewerApp {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
-                let at_first = self.current_index == 0 || self.svg_paths.is_empty();
-                let at_last = self.current_index + 1 >= self.svg_paths.len();
-                let has_plots = !self.svg_paths.is_empty();
+                let at_first = self.current_index == 0 || self.pages.is_empty();
+                let at_last = self.current_index + 1 >= self.pages.len();
+                let has_plots = !self.pages.is_empty();
 
                 // Filled-triangle nav arrows at 16pt so the icon
                 // reads at a glance, matching RStudio's plot pane.
@@ -1039,10 +1199,10 @@ impl eframe::App for ViewerApp {
                 }
                 ui.separator();
 
-                let counter_text = if self.svg_paths.is_empty() {
+                let counter_text = if self.pages.is_empty() {
                     "no plots".to_string()
                 } else {
-                    format!("Plot {} / {}", self.current_index + 1, self.svg_paths.len())
+                    format!("Plot {} / {}", self.current_index + 1, self.pages.len())
                 };
                 ui.label(counter_text);
                 ui.separator();
@@ -1059,6 +1219,18 @@ impl eframe::App for ViewerApp {
                 ui.add_enabled_ui(has_plots, |ui| {
                     ui.toggle_value(&mut self.zoom_mode, zoom_label);
                 });
+                // With options(rustgd.debug_svg = TRUE) R writes each page
+                // both ways. The SVG toggle, or the S key, flips between
+                // drawing the page from its .rgd and from its SVG, and the
+                // label says which one is on screen and how long it took.
+                if self.current_has_both() {
+                    ui.separator();
+                    ui.toggle_value(&mut self.show_svg, "SVG");
+                    if let Some(d) = &self.displayed {
+                        let source = if is_rgd(&d.path) { ".rgd" } else { "SVG" };
+                        ui.label(format!("{source} {} ms", d.took.as_millis()));
+                    }
+                }
 
                 // Action buttons pinned to the right edge. Right-to-
                 // left layout means we add in reverse visual order:
@@ -1165,7 +1337,12 @@ impl eframe::App for ViewerApp {
                         .requested
                         .as_ref()
                         .map_or(true, |r| r.path != key.path || r.mtime != key.mtime);
-                    let heavy = file_len >= PREVIEW_MIN_BYTES;
+                    let heavy_from = if is_rgd(&current_path) {
+                        PREVIEW_MIN_BYTES_RGD
+                    } else {
+                        PREVIEW_MIN_BYTES
+                    };
+                    let heavy = file_len >= heavy_from;
                     let wait_for_replay = !content_changed
                         && heavy
                         && now.duration_since(self.target_changed_at) < HEAVY_RESIZE_SETTLE;
@@ -1299,7 +1476,7 @@ impl eframe::App for ViewerApp {
                 }
             } else if waited {
                 let note = if failed {
-                    "failed to render SVG"
+                    "failed to render plot"
                 } else {
                     "rendering\u{2026}"
                 };

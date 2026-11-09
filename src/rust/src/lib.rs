@@ -16,9 +16,11 @@
 //!
 //! Drawing. Every callback appends a record to the page's display list,
 //! defined in display_list.rs. Each write turns that list into the
-//! page's files. It always becomes SVG text, and with
-//! options(rustgd.transport = "binary") the list itself is also written
-//! as a .rgd file. extendr's default CLIPPING_STRATEGY is DeviceAndEngine,
+//! page's file. By default that is SVG text. With
+//! options(rustgd.transport = "binary") the list itself is written as a
+//! .rgd file, which the viewer draws directly, and
+//! options(rustgd.debug_svg = TRUE) adds the SVG beside it for comparison.
+//! extendr's default CLIPPING_STRATEGY is DeviceAndEngine,
 //! so canClip is set to TRUE automatically at device creation and R calls
 //! our clip() callback throughout each plot.
 
@@ -66,10 +68,14 @@ static CURRENT_PAGE: AtomicUsize = AtomicUsize::new(0);
 /// history to match.
 static GALLERY_RESET: AtomicBool = AtomicBool::new(false);
 
-/// Whether devices also write each page's display list as a .rgd file.
-/// R sets it from options(rustgd.transport) right before a device opens,
-/// and the redraw devices R opens later follow the same setting.
+/// Whether devices write each page's display list as a .rgd file instead
+/// of SVG. R sets it from options(rustgd.transport) right before a device
+/// opens, and the redraw devices R opens later follow the same setting.
 static TRANSPORT_BINARY: AtomicBool = AtomicBool::new(false);
+
+/// In binary mode, also write each page as SVG, for comparing the two.
+/// R sets it from options(rustgd.debug_svg) along with the transport.
+static DEBUG_SVG: AtomicBool = AtomicBool::new(false);
 
 // ----------------------------------------------------------------------
 // libc bindings
@@ -332,9 +338,12 @@ struct RustgdDevice {
     /// Set on a short-lived redraw device. It always writes this page's
     /// file and leaves the page counter and session folder alone.
     offscreen_page: Option<usize>,
-    /// Also write each page's display list as a .rgd file. Fixed when the
+    /// Write each page's display list as a .rgd file. Fixed when the
     /// device opens, from options(rustgd.transport).
     binary: bool,
+    /// Write each page as SVG. Always true in SVG mode, and in binary mode
+    /// only with options(rustgd.debug_svg = TRUE).
+    write_svg: bool,
     page: PageBuffer,
     font_bytes: [[Vec<u8>; NUM_FACES]; NUM_FAMILIES],
 }
@@ -363,6 +372,7 @@ impl RustgdDevice {
             viewer_child: Some(child),
             offscreen_page: None,
             binary: TRANSPORT_BINARY.load(Ordering::SeqCst),
+            write_svg: !TRANSPORT_BINARY.load(Ordering::SeqCst) || DEBUG_SVG.load(Ordering::SeqCst),
             page: PageBuffer::new(),
             font_bytes,
         })
@@ -384,6 +394,7 @@ impl RustgdDevice {
             viewer_child: None,
             offscreen_page: Some(page),
             binary: TRANSPORT_BINARY.load(Ordering::SeqCst),
+            write_svg: !TRANSPORT_BINARY.load(Ordering::SeqCst) || DEBUG_SVG.load(Ordering::SeqCst),
             page: PageBuffer::new(),
             font_bytes,
         })
@@ -466,9 +477,9 @@ impl RustgdDevice {
             file.extend_from_slice(records);
             write_atomic(&self.dir.join(format!("plot-{:04}.rgd", n)), &file);
         }
-        // The viewer reads SVG until it learns to draw .rgd pages, so every
-        // page is written as SVG as well for now.
-        if self.page.svg.catch_up(self.page.records.bytes()).is_ok() {
+        // The .rgd is written first, so in debug mode the viewer finds a
+        // page's .rgd before its SVG and draws from it.
+        if self.write_svg && self.page.svg.catch_up(self.page.records.bytes()).is_ok() {
             let svg = self.page.svg.render(w, h, display_list::WHITE);
             write_atomic(&self.dir.join(format!("plot-{:04}.svg", n)), svg.as_bytes());
         }
@@ -1326,16 +1337,18 @@ fn rustgd_device_size() -> Vec<f64> {
 }
 
 // Choose how devices opened from now on write their pages. R calls this
-// with options(rustgd.transport) right before it opens a device.
+// with options(rustgd.transport) and options(rustgd.debug_svg) right
+// before it opens a device.
 #[extendr]
-fn rustgd_set_transport(binary: bool) {
+fn rustgd_set_transport(binary: bool, debug_svg: bool) {
     TRANSPORT_BINARY.store(binary, Ordering::SeqCst);
+    DEBUG_SVG.store(debug_svg, Ordering::SeqCst);
 }
 
-// Check every .rgd page in a folder against the .svg written beside it.
+// Check every .rgd page in a folder that has an .svg written beside it.
 // Each .rgd is decoded and turned back into SVG, which must match the .svg
 // byte for byte. Returns how many pages were checked and which pages
-// differ, fail to decode, or have no .svg.
+// differ or fail to decode. Pages without an .svg are skipped.
 #[extendr]
 fn rustgd_binary_check(dir: &str) -> Robj {
     let mut checked = 0i32;
@@ -1351,8 +1364,11 @@ fn rustgd_binary_check(dir: &str) -> Robj {
             else {
                 continue;
             };
-            checked += 1;
             let svg_path = std::path::Path::new(dir).join(format!("plot-{:04}.svg", page));
+            if !svg_path.exists() {
+                continue;
+            }
+            checked += 1;
             let same = match (fs::read(entry.path()), fs::read(&svg_path)) {
                 (Ok(rgd), Ok(svg)) => display_list::file_to_svg(&rgd)
                     .map(|s| s.into_bytes() == svg)

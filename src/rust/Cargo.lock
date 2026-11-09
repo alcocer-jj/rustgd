@@ -4194,6 +4194,7 @@ dependencies = [
  "eframe",
  "egui",
  "extendr-api",
+ "kurbo",
  "notify",
  "png 0.17.16",
  "resvg",

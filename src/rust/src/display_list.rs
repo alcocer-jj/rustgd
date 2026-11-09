@@ -946,14 +946,22 @@ fn write_points(out: &mut String, points: Points) {
     }
 }
 
-fn text_element(t: &Text) -> String {
-    let anchor = if t.hadj < 0.25 {
-        "start"
-    } else if t.hadj > 0.75 {
-        "end"
+/// The SVG text-anchor for R's horizontal adjustment, as 0 for start, 1
+/// for middle, and 2 for end.
+pub(crate) fn text_anchor_code(hadj: f32) -> u8 {
+    if hadj < 0.25 {
+        0
+    } else if hadj > 0.75 {
+        2
     } else {
-        "middle"
-    };
+        1
+    }
+}
+
+/// A label as an SVG text element. The .rgd renderer lays labels out from
+/// this same text, so both paths shape text identically.
+pub(crate) fn text_element(t: &Text) -> String {
+    let anchor = ["start", "middle", "end"][text_anchor_code(t.hadj) as usize];
     // R rotates text anticlockwise and SVG rotates clockwise, so the angle
     // is negated. The rotation center is the text's anchor point.
     let transform = if t.rot.abs() > 0.001 {
