@@ -58,20 +58,10 @@ rustgd <- function() {
   .rustgd_state$active <- TRUE
   .rustgd_state$session_dir <- file.path(tempdir(), paste0("rustgd-", Sys.getpid()))
 
-  # How the device writes its pages. "binary" writes each page's display
-  # list as a .rgd file, which the viewer draws directly. With
-  # options(rustgd.debug_svg = TRUE) it also writes the SVG, and the
-  # viewer can flip between drawing either one. Both switches are
-  # temporary and go away once binary is the only way pages are written.
-  transport <- getOption("rustgd.transport", "svg")
-  if (!identical(transport, "svg") && !identical(transport, "binary")) {
-    warning("options(rustgd.transport) must be \"svg\" or \"binary\". Using \"svg\".")
-    transport <- "svg"
-  }
-  rustgd_set_transport(
-    identical(transport, "binary"),
-    isTRUE(getOption("rustgd.debug_svg", FALSE))
-  )
+  # Each page is written as a .rgd display list, which the viewer draws
+  # directly. With options(rustgd.debug_svg = TRUE) the device also writes
+  # each page as SVG, and the viewer can flip between drawing either one.
+  rustgd_set_debug_svg(isTRUE(getOption("rustgd.debug_svg", FALSE)))
 
   rustgd_activate(.rustgd_state$session_dir)
   .rustgd_state$device_num <- dev.cur()
@@ -594,11 +584,10 @@ rustgd_handle_clear_all <- function() {
   invisible(NULL)
 }
 
-#' Internal. Checks every page written with options(rustgd.transport =
-#' "binary") and options(rustgd.debug_svg = TRUE). Each .rgd file is
-#' decoded and turned back into SVG, which must match the .svg written
-#' beside it byte for byte. Prints a summary and returns the pages that
-#' differ.
+#' Internal. Checks every page written with options(rustgd.debug_svg =
+#' TRUE). Each .rgd file is decoded and turned back into SVG, which must
+#' match the .svg written beside it byte for byte. Prints a summary and
+#' returns the pages that differ.
 #' @noRd
 .rustgd_check_binary <- function() {
   session_dir <- .rustgd_state$session_dir

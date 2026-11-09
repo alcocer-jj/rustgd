@@ -25,7 +25,7 @@ rustgd_device_size <- function() .Call(wrap__rustgd_device_size)
 
 rustgd_open_offscreen <- function(page, width, height) .Call(wrap__rustgd_open_offscreen, page, width, height)
 
-rustgd_set_transport <- function(binary, debug_svg) .Call(wrap__rustgd_set_transport, binary, debug_svg)
+rustgd_set_debug_svg <- function(on) .Call(wrap__rustgd_set_debug_svg, on)
 
 rustgd_binary_check <- function(dir) .Call(wrap__rustgd_binary_check, dir)
 

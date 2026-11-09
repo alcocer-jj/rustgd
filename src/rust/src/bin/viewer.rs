@@ -1,7 +1,8 @@
 //! rustgd-viewer, the standalone window the device's R side launches.
 //! Watches a directory passed as argv[1] and displays the plots in it.
-//! A page arrives as an SVG file or as a .rgd display list, which is drawn
-//! directly without parsing anything.
+//! Each page arrives as a .rgd display list and is drawn directly, with
+//! nothing to parse. With options(rustgd.debug_svg = TRUE) R also writes
+//! each page as SVG, and the viewer can draw either one.
 //! Loads a bundled fonts directory from argv[2]. Liberation Sans is
 //! registered as egui's primary font so the toolbar's arrows render
 //! correctly and the UI typography matches the SVG plot typography.
@@ -82,6 +83,11 @@ const PREVIEW_MIN_BYTES_RGD: u64 = 24_000_000;
 /// How long a render may run before the "Rendering" note appears, so
 /// fast plots never flash it.
 const BUSY_NOTE_DELAY: Duration = Duration::from_millis(250);
+
+/// Device units per inch. The device tells R its units are 1/96 inch, so
+/// a plot 960 units wide is a 10 inch plot. The export dialog sizes the
+/// plot in inches with this, whatever DPI is chosen.
+const DEVICE_DPI: f32 = 96.0;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -267,6 +273,8 @@ struct Displayed {
     rendered_size: egui::Vec2,
     /// How long the render thread took to read and draw it.
     took: Duration,
+    /// The plot's own size in device units, which exports are sized from.
+    page_size: egui::Vec2,
 }
 
 /// One render request. A file version (path plus mtime) at a raster size.
@@ -292,6 +300,7 @@ struct RenderResult {
     /// None when the file could not be read or parsed.
     image: Option<(egui::ColorImage, egui::Vec2)>,
     took: Duration,
+    page_size: egui::Vec2,
 }
 
 /// Holds at most one waiting job. Sending a new one replaces it.
@@ -501,41 +510,43 @@ impl ViewerApp {
     /// are computed so that `inches × DPI` matches the on-screen
     /// pixel count — i.e. a fresh "Use window size" snapshot.
     fn open_export_dialog(&mut self) {
-        let (lw, lh) = self.last_plot_area_logical;
-        if lw > 0 && lh > 0 && self.export_dpi > 0 {
-            self.export_width_in = lw as f32 / self.export_dpi as f32;
-            self.export_height_in = lh as f32 / self.export_dpi as f32;
-        }
+        self.set_export_size_to_window();
         self.export_dialog_open = true;
     }
 
-    /// Compute the actual pixel dimensions of the exported PNG given
-    /// the user's inches × DPI inputs. The SVG's intrinsic aspect
-    /// ratio is preserved: if the user's bounding box doesn't match
-    /// the SVG aspect, the output fits inside the box without
-    /// distortion (one dimension may end up smaller than requested).
+    /// Set the export size to the plot's size in inches. The device lays
+    /// plots out at 96 units per inch, so this depends only on the plot
+    /// and never on the DPI in the dialog. The DPI then sets only how many
+    /// pixels a PNG gets, and reopening the dialog shows the same numbers
+    /// until the window changes.
+    fn set_export_size_to_window(&mut self) {
+        let size = match self.displayed.as_ref().map(|d| d.page_size) {
+            Some(page) if page.x > 0.0 && page.y > 0.0 => page,
+            _ => {
+                let (lw, lh) = self.last_plot_area_logical;
+                egui::vec2(lw as f32, lh as f32)
+            }
+        };
+        if size.x > 0.0 && size.y > 0.0 {
+            self.export_width_in = size.x / DEVICE_DPI;
+            self.export_height_in = size.y / DEVICE_DPI;
+        }
+    }
+
+    /// The pixel size the exported PNG will have, for the dialog's Output
+    /// line. The plot keeps its aspect ratio, so when the box does not
+    /// match it, the image fits inside the box and one side comes out
+    /// smaller than requested.
     fn computed_output_size(&self) -> (u32, u32) {
         let target_w_px = (self.export_width_in * self.export_dpi as f32).max(1.0);
         let target_h_px = (self.export_height_in * self.export_dpi as f32).max(1.0);
-
-        if let Some(d) = &self.displayed {
-            if d.rendered_size.x > 0.0 && d.rendered_size.y > 0.0 {
-                let svg_aspect = d.rendered_size.x / d.rendered_size.y;
-                let target_aspect = target_w_px / target_h_px;
-                return if target_aspect > svg_aspect {
-                    // Box is wider than the plot; height is the limit.
-                    let h = target_h_px;
-                    let w = h * svg_aspect;
-                    (w as u32, h as u32)
-                } else {
-                    // Box is taller than (or matches) the plot; width limits.
-                    let w = target_w_px;
-                    let h = w / svg_aspect;
-                    (w as u32, h as u32)
-                };
+        match self.displayed.as_ref().map(|d| d.page_size) {
+            Some(page) if page.x > 0.0 && page.y > 0.0 => {
+                let (w, h, _) = export_fit(page.x, page.y, target_w_px, target_h_px);
+                (w, h)
             }
+            _ => (target_w_px.round() as u32, target_h_px.round() as u32),
         }
-        (target_w_px as u32, target_h_px as u32)
     }
 
     /// Render the floating Export dialog if it's open. Handles the
@@ -552,6 +563,7 @@ impl ViewerApp {
 
         let mut save_clicked = false;
         let mut cancel_clicked = false;
+        let mut use_window_size = false;
         let logical_window = self.last_plot_area_logical;
         let preview = self.computed_output_size();
 
@@ -581,11 +593,7 @@ impl ViewerApp {
 
                 if logical_window.0 > 0 && logical_window.1 > 0 {
                     if ui.button("Use window size").clicked() {
-                        if self.export_dpi > 0 {
-                            self.export_width_in = logical_window.0 as f32 / self.export_dpi as f32;
-                            self.export_height_in =
-                                logical_window.1 as f32 / self.export_dpi as f32;
-                        }
+                        use_window_size = true;
                     }
                 }
 
@@ -625,6 +633,9 @@ impl ViewerApp {
                 });
             });
 
+        if use_window_size {
+            self.set_export_size_to_window();
+        }
         if cancel_clicked {
             self.export_dialog_open = false;
         }
@@ -740,13 +751,7 @@ impl ViewerApp {
         // Inches × DPI → target pixel bounding box.
         let target_w = (self.export_width_in * self.export_dpi as f32).max(1.0);
         let target_h = (self.export_height_in * self.export_dpi as f32).max(1.0);
-
-        let scale_x = target_w / svg_w;
-        let scale_y = target_h / svg_h;
-        let scale = scale_x.min(scale_y);
-
-        let pixmap_w = (svg_w * scale).max(1.0) as u32;
-        let pixmap_h = (svg_h * scale).max(1.0) as u32;
+        let (pixmap_w, pixmap_h, scale) = export_fit(svg_w, svg_h, target_w, target_h);
 
         let mut pixmap = Pixmap::new(pixmap_w, pixmap_h)
             .ok_or_else(|| "failed to allocate pixmap".to_string())?;
@@ -774,9 +779,7 @@ impl ViewerApp {
 
         let target_w = (self.export_width_in * self.export_dpi as f32).max(1.0);
         let target_h = (self.export_height_in * self.export_dpi as f32).max(1.0);
-        let scale = (target_w / page.width).min(target_h / page.height);
-        let pixmap_w = (page.width * scale).max(1.0) as u32;
-        let pixmap_h = (page.height * scale).max(1.0) as u32;
+        let (pixmap_w, pixmap_h, scale) = export_fit(page.width, page.height, target_w, target_h);
 
         let mut pixmap = Pixmap::new(pixmap_w, pixmap_h)
             .ok_or_else(|| "failed to allocate pixmap".to_string())?;
@@ -902,6 +905,7 @@ impl ViewerApp {
                 full_quality: result.full_quality,
                 rendered_size,
                 took: result.took,
+                page_size: result.page_size,
             });
             self.last_failed = None;
         }
@@ -981,6 +985,7 @@ fn render_thread(
                         full_quality: true,
                         image: None,
                         took: started.elapsed(),
+                        page_size: egui::Vec2::ZERO,
                     });
                     ctx.request_repaint();
                     continue;
@@ -990,6 +995,7 @@ fn render_thread(
         let Some((_, _, page)) = parsed.as_ref() else {
             continue;
         };
+        let size = page_size(page);
 
         if let Some((w, h)) = job.preview {
             if let Some(image) = rasterize(page, w, h, &opt, &mut texts) {
@@ -999,6 +1005,7 @@ fn render_thread(
                     full_quality: false,
                     image: Some(image),
                     took: started.elapsed(),
+                    page_size: size,
                 });
                 ctx.request_repaint();
             }
@@ -1016,6 +1023,7 @@ fn render_thread(
             full_quality: true,
             image,
             took: started.elapsed(),
+            page_size: size,
         });
         ctx.request_repaint();
     }
@@ -1052,6 +1060,24 @@ fn rasterize(
     };
     drop(pixmap);
     Some((color_image, rendered))
+}
+
+/// A plot's own size in device units.
+fn page_size(page: &Parsed) -> egui::Vec2 {
+    match page {
+        Parsed::Svg(tree) => egui::vec2(tree.size().width(), tree.size().height()),
+        Parsed::Rgd(page) => egui::vec2(page.width, page.height),
+    }
+}
+
+/// The pixel size of an export that fits a page inside a box, keeping the
+/// page's aspect ratio, and the scale it is drawn at. The dialog's Output
+/// line and the saved file both come from here, so they always agree.
+fn export_fit(page_w: f32, page_h: f32, box_w: f32, box_h: f32) -> (u32, u32, f32) {
+    let scale = (box_w / page_w).min(box_h / page_h);
+    let w = (page_w * scale).round().max(1.0) as u32;
+    let h = (page_h * scale).round().max(1.0) as u32;
+    (w, h, scale)
 }
 
 /// Draw a parsed SVG to fit inside target_w by target_h pixels.

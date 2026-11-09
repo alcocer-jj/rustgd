@@ -50,7 +50,7 @@ For anything that already lives at a live address, a Shiny app, a local dashboar
 
 ## How it works
 
-Under the hood rustgd is an R package with a Rust core built using extendr. The plot device is a true R graphics device compiled into the package; it serializes each page to SVG and hands it to a separate viewer process through a per-session temporary directory. That same directory is how the window signals resizes back to R, which is what lets the device replay a plot at the new size instead of scaling a bitmap.
+Under the hood rustgd is an R package with a Rust core built using extendr. The plot device is a true R graphics device compiled into the package; it records each page as a compact binary display list and hands it to a separate viewer process, which draws it directly through a per-session temporary directory. That same directory is how the window signals resizes back to R, which is what lets the device replay a plot at the new size instead of scaling a bitmap.
 
 The data frame and web viewers are two more small native binaries. Both `View()` and the lowercase `view()` (the latter also exported by tibble) are exported functions that write your data as Apache Arrow and feed the table window, and R's `viewer` and `shiny.launch.browser` options are pointed at the web binary so widgets and apps route there automatically. All three binaries are compiled when the package builds and shipped inside it, so there is nothing extra to download or launch at runtime. The windows open lazily, the first time you actually draw a plot, view a frame, or show a widget.
 
