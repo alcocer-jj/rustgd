@@ -237,8 +237,8 @@ rustgd_poll_resize <- function() {
   )
 
   # Redraw at most one stale plot per poll, so R hands the console back
-  # between plots. Ctrl+C stops the redraw in progress and pauses the
-  # plots that are off screen until they are viewed.
+  # between plots. Ctrl+C pauses the plots that are off screen until they
+  # are viewed. A redraw that is busy in C or Rust code finishes first.
   tryCatch(
     rustgd_rebuild_next(),
     error = function(e) NULL,
@@ -362,6 +362,13 @@ rustgd_rebuild_next <- function() {
   # is retried on the next resize rather than on every poll. An interrupt
   # skips this line and leaves the plot stale.
   .rustgd_state$plot_history[[i]]$size <- size
+
+  # Most of a replay runs in C and Rust code, where R does not check for
+  # Ctrl+C. A Ctrl+C pressed then stays pending, and R would notice it
+  # only after this poll returns, too late to pause the remaining plots.
+  # Sys.sleep(0) makes R check now, while the poll's interrupt handler
+  # can still catch it.
+  Sys.sleep(0)
   invisible(TRUE)
 }
 
