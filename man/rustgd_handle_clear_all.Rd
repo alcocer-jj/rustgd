@@ -2,16 +2,16 @@
 % Please edit documentation in R/rustgd.R
 \name{rustgd_handle_clear_all}
 \alias{rustgd_handle_clear_all}
-\title{Internal: process a clear-all signal from the viewer. Empties the
-plot history, deletes every plot-NNNN.svg in the session dir, and
-resets the page counter so the next user-issued plot() starts fresh
-at plot-0001.svg.}
+\title{Internal. Processes a clear-all signal from the viewer. Empties the
+plot history, deletes every page file in the session dir, and resets
+the page counter so the next user-issued plot() starts fresh at
+page 1.}
 \usage{
 rustgd_handle_clear_all()
 }
 \description{
-Internal: process a clear-all signal from the viewer. Empties the
-plot history, deletes every plot-NNNN.svg in the session dir, and
-resets the page counter so the next user-issued plot() starts fresh
-at plot-0001.svg.
+Internal. Processes a clear-all signal from the viewer. Empties the
+plot history, deletes every page file in the session dir, and resets
+the page counter so the next user-issued plot() starts fresh at
+page 1.
 }

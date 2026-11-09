@@ -58,6 +58,16 @@ rustgd <- function() {
   .rustgd_state$active <- TRUE
   .rustgd_state$session_dir <- file.path(tempdir(), paste0("rustgd-", Sys.getpid()))
 
+  # How the device writes its pages. "binary" also writes each page's
+  # display list as a .rgd file next to its SVG. This switch is temporary
+  # and goes away once the viewer draws .rgd pages itself.
+  transport <- getOption("rustgd.transport", "svg")
+  if (!identical(transport, "svg") && !identical(transport, "binary")) {
+    warning("options(rustgd.transport) must be \"svg\" or \"binary\". Using \"svg\".")
+    transport <- "svg"
+  }
+  rustgd_set_transport(identical(transport, "binary"))
+
   rustgd_activate(.rustgd_state$session_dir)
   .rustgd_state$device_num <- dev.cur()
 
@@ -108,7 +118,7 @@ rustgd <- function() {
 #     for a ggplot and several for a layered base plot like plot() then
 #     lines(). They are evaluated again only if the replay fails.
 #   - $page is the device page the plot was drawn on, so the plot always
-#     maps to its own plot-NNNN.svg, even after other plots are cleared.
+#     maps to its own page files, even after other plots are cleared.
 #   - $size is the device size the plot was last drawn at. A plot whose
 #     size differs from the device's current size is stale.
 .rustgd_state$plot_history <- list()
@@ -549,10 +559,10 @@ rustgd_task_callback <- function(expr) {
   invisible(NULL)
 }
 
-#' Internal: process a clear-all signal from the viewer. Empties the
-#' plot history, deletes every plot-NNNN.svg in the session dir, and
-#' resets the page counter so the next user-issued plot() starts fresh
-#' at plot-0001.svg.
+#' Internal. Processes a clear-all signal from the viewer. Empties the
+#' plot history, deletes every page file in the session dir, and resets
+#' the page counter so the next user-issued plot() starts fresh at
+#' page 1.
 rustgd_handle_clear_all <- function() {
   session_dir <- .rustgd_state$session_dir
   if (is.null(session_dir)) {
@@ -566,17 +576,38 @@ rustgd_handle_clear_all <- function() {
   .rustgd_state$visible <- NULL
   .rustgd_state$rebuild_paused <- FALSE
 
-  svg_files <- list.files(
+  page_files <- list.files(
     session_dir,
-    pattern = "^plot-[0-9]+\\.svg$",
+    pattern = "^plot-[0-9]+\\.(svg|rgd)$",
     full.names = TRUE
   )
-  if (length(svg_files) > 0) {
-    try(file.remove(svg_files), silent = TRUE)
+  if (length(page_files) > 0) {
+    try(file.remove(page_files), silent = TRUE)
   }
 
   rustgd_set_current_page(0)
   invisible(NULL)
+}
+
+#' Internal. Checks every page written with options(rustgd.transport =
+#' "binary"). Each .rgd file is decoded and turned back into SVG, which
+#' must match the .svg written beside it byte for byte. Prints a summary
+#' and returns the pages that differ.
+#' @noRd
+.rustgd_check_binary <- function() {
+  session_dir <- .rustgd_state$session_dir
+  if (is.null(session_dir) || !dir.exists(session_dir)) {
+    message("No rustgd session folder yet. Draw a plot first.")
+    return(invisible(integer(0)))
+  }
+  result <- rustgd_binary_check(session_dir)
+  bad <- result$mismatched
+  message(sprintf(
+    "Checked %d .rgd pages. %d differ from their .svg.",
+    result$checked,
+    length(bad)
+  ))
+  invisible(bad)
 }
 
 #' Internal. Processes a clear-plot signal from the viewer. The marker
@@ -605,25 +636,33 @@ rustgd_handle_clear_plot <- function() {
     return(invisible(NULL))
   }
 
-  files <- list.files(session_dir, pattern = "^plot-[0-9]+\\.svg$")
-  file_pages <- as.integer(sub("^plot-([0-9]+)\\.svg$", "\\1", files))
+  # A page has an .svg file, and an .rgd file too in binary mode.
+  files <- list.files(session_dir, pattern = "^plot-[0-9]+\\.(svg|rgd)$")
+  file_pages <- as.integer(sub("^plot-([0-9]+)\\.(svg|rgd)$", "\\1", files))
   if (!(page %in% file_pages)) {
     return(invisible(NULL))
   }
 
-  # Delete the plot's file, then move every higher page down by one.
-  try(
-    file.remove(file.path(session_dir, sprintf("plot-%04d.svg", page))),
-    silent = TRUE
-  )
-  for (p in sort(file_pages[file_pages > page])) {
-    try(
-      file.rename(
-        file.path(session_dir, sprintf("plot-%04d.svg", p)),
-        file.path(session_dir, sprintf("plot-%04d.svg", p - 1L))
-      ),
-      silent = TRUE
-    )
+  # Delete the plot's files, then move every higher page down by one.
+  for (ext in c("svg", "rgd")) {
+    target <- file.path(session_dir, sprintf("plot-%04d.%s", page, ext))
+    if (file.exists(target)) {
+      try(file.remove(target), silent = TRUE)
+    }
+  }
+  for (p in sort(unique(file_pages[file_pages > page]))) {
+    for (ext in c("svg", "rgd")) {
+      old_file <- file.path(session_dir, sprintf("plot-%04d.%s", p, ext))
+      if (file.exists(old_file)) {
+        try(
+          file.rename(
+            old_file,
+            file.path(session_dir, sprintf("plot-%04d.%s", p - 1L, ext))
+          ),
+          silent = TRUE
+        )
+      }
+    }
   }
 
   # The history changes the same way.
