@@ -29,9 +29,11 @@ explicit URLs via \code{\link[=rustgd_browse]{rustgd_browse()}}). The data-frame
 attached with \code{library(rustgd)}, so it does not require this call.
 }
 \details{
-To make the plot and web viewer activation persist across sessions,
-this function can add a small snippet to your user-level \code{.Rprofile}.
-Because that edits a file in your home directory, it is only done in an
+To make activation persist across sessions, this function can add a
+small snippet to your user-level \code{.Rprofile}. The snippet attaches the
+package (so \code{View()} and \code{view()} come with it) and turns on the plot
+device and web viewer, restoring the full suite at startup. Because
+that edits a file in your home directory, it is only done in an
 interactive session and only after you explicitly confirm at a prompt.
 If you decline, or if the session is non-interactive (Rscript, R CMD
 BATCH, knitr, testthat, package checks), nothing is written and the
